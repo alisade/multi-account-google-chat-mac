@@ -1,0 +1,6 @@
+.DS_Store
+.chatapp.bin
+# Your own workspaces and logos stay local.
+workspaces.conf
+icons/*
+!icons/README.md
