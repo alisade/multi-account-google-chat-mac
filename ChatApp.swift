@@ -1095,6 +1095,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKUIDelegate, WKNaviga
         return workspaces.first { $0.key == key }
     }
 
+    // Post a banner that replaces the previous one in the same group (one
+    // conversation, or a workspace's generic "unread" banner). Each post gets a
+    // fresh request id: re-adding an id that is still in Notification Center
+    // only updates it in place -- no banner, no sound -- so a second message
+    // before the first was read would arrive silently.
+    func postReplacing(_ content: UNNotificationContent, group: String) {
+        let center = UNUserNotificationCenter.current()
+        center.getDeliveredNotifications { delivered in
+            let old = delivered.map { $0.request.identifier }.filter { $0.hasPrefix(group + "#") }
+            center.removeDeliveredNotifications(withIdentifiers: old)
+            center.add(UNNotificationRequest(identifier: group + "#" + UUID().uuidString,
+                                             content: content, trigger: nil))
+        }
+    }
+
     // A new message in a known conversation: banner titled with the
     // conversation (the sender, for a DM) and, when Chat's Home list shows it,
     // the message preview. One banner per conversation; a newer message
@@ -1111,8 +1126,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKUIDelegate, WKNaviga
         content.sound = .default
         content.threadIdentifier = ws.name
         content.userInfo = ["workspace": ws.key, "conversation": conv]
-        UNUserNotificationCenter.current().add(
-            UNNotificationRequest(identifier: "\(ws.key)|conv|\(conv)", content: content, trigger: nil))
+        postReplacing(content, group: "\(ws.key)|conv|\(conv)")
         bounceDock()
     }
 
@@ -1122,13 +1136,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKUIDelegate, WKNaviga
     // exposes no sender or text here, only that -- and roughly how much -- is
     // unread.
     func notifyUnread(_ ws: Workspace) {
-        let center = UNUserNotificationCenter.current()
-        let reqID = "\(ws.key)|unread"
         guard ws.unread || ws.unreadCount > 0 else {
-            let prefix = "\(ws.key)|"
+            let center = UNUserNotificationCenter.current()
+            let prefixes = ["\(ws.key)|unread#", "\(ws.key)|conv|"]
             center.getDeliveredNotifications { delivered in
                 center.removeDeliveredNotifications(withIdentifiers: delivered.map { $0.request.identifier }
-                    .filter { $0 == reqID || $0.hasPrefix(prefix + "conv|") })
+                    .filter { id in prefixes.contains { id.hasPrefix($0) } })
             }
             return
         }
@@ -1141,7 +1154,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKUIDelegate, WKNaviga
         content.sound = .default
         content.threadIdentifier = ws.name
         content.userInfo = ["workspace": ws.key]
-        center.add(UNNotificationRequest(identifier: reqID, content: content, trigger: nil))
+        postReplacing(content, group: "\(ws.key)|unread")
         bounceDock()
     }
 
