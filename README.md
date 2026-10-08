@@ -19,11 +19,26 @@ Xcode project, no dependencies.
   dot on the Dock icon (also shown in cmd+tab) if any workspace does. Google
   Chat exposes no reliable total count, so the app mirrors Chat's own favicon
   "dot" signal -- the same thing that dots a browser tab.
+- **Mute and quiet hours per workspace** (right-click > Notifications): mute
+  for an hour, until tomorrow or indefinitely, or turn on quiet hours (by
+  default weekday evenings 18:00-08:00 plus weekends; the hours -- a same-day
+  range like 09:00-17:00 or an overnight one -- and the weekends are set in
+  Settings). Muted workspaces still count unread, with a grey badge.
 - **Menu-bar inbox.** The menu-bar icon shows the total unread; its menu
   lists every unread conversation across all workspaces -- name, message
   preview and count, newest first, grouped by workspace -- and clicking one
   opens it. The Dock icon's right-click menu lists the same, one line each. Toggle
   the icon under Chats > Show in Menu Bar.
+- **Settings** (Chats > Settings..., Cmd+,): appearance, menu-bar inbox, launch
+  at login, quiet hours (on/off per workspace, and the times), and how to get
+  **message previews**. Previews
+  come from Chat's Home list, which is only on the page while a workspace shows
+  Home (the sidebar has names and counts, not text), so choose: only while on
+  Home (default); send background workspaces back to Home after N minutes
+  (never during a call or a sign-in); or keep a hidden Home view per workspace
+  (previews everywhere, more memory). Settings also has whether Reply sends
+  immediately and, under Advanced, the Web Inspector (off by default).
+- **Launch at Login** under the Chats menu.
 - **Closing the window hides it** (Cmd+W): the app keeps running, so unread
   counts and notifications stay live; click the Dock icon to bring it back.
 - **Stays connected.** After sleep or a network outage of more than a minute
@@ -36,6 +51,9 @@ Xcode project, no dependencies.
   "Couldn't load". The app opens Calendar once, hidden, in each workspace so
   it signs itself in, and redoes that (then reloads the panel) if the panel is
   ever sent to sign-in again.
+- **App appearance** (View > Appearance): System, Light or Dark for the app's
+  window, title bar and rail. Chat's pages keep following the system
+  appearance -- Chat has its own theme setting.
 - **Unread counts and notifications.** The rail and Dock show unread counts
   read from Chat's sidebar (a plain dot when Chat shows no number). Chat
   delivers its own alerts by Web Push, which an embedded WKWebView cannot
@@ -46,8 +64,8 @@ Xcode project, no dependencies.
   preview, and bounces the Dock icon once. Every message gets its own banner.
   Clicking one opens that conversation; **Reply** brings the app forward,
   opens the conversation and types your reply into Chat's message box for you
-  to check and send -- only once the right conversation is open; otherwise the
-  reply goes to the clipboard.
+  to check and send (or sends it, if turned on in Settings) -- only once the
+  right conversation is open; otherwise the reply goes to the clipboard.
   **Mark as Read** marks it read in the background. This reads Chat's page
   markup, so it is best effort; if it stops matching, banners fall back to a
   generic "New message", and the app logs which selector stopped matching:
