@@ -31,9 +31,11 @@ Xcode project, no dependencies.
   evenings 18:00-08:00 and weekends; change with
   `defaults write <bundle-id> QuietHoursStart -int 19` / `QuietHoursEnd`).
   Muted workspaces still count unread, with a grey badge.
-- **Menu-bar icon** with the total unread and a menu to open each workspace;
-  the Dock icon's right-click menu lists them too. Toggle it under
-  Chats > Show in Menu Bar.
+- **Menu-bar inbox.** The menu-bar icon shows the total unread; its menu
+  lists every unread conversation across all workspaces -- name, message
+  preview and count, newest first, grouped by workspace -- and clicking one
+  opens it. The Dock icon's right-click menu lists the workspaces too. Toggle
+  the icon under Chats > Show in Menu Bar.
 - **Launch at Login** under the Chats menu.
 - **Keyboard shortcuts**: Cmd+1..9 switch workspace, Cmd+Shift+[ / ] step
   through them, Cmd+N starts a new chat (Chat's people picker), Cmd+F

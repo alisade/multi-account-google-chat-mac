@@ -48,6 +48,7 @@ final class Workspace {
     var lastPageNotification: Date?   // last banner raised by the page itself
     var lastBanner: [String: (text: String, at: Date)] = [:]   // per conversation, for de-duplication
     var configIndex = 0               // position in workspaces.conf, for the default colour
+    var inbox: [(id: String, name: String, text: String, count: Int)] = []   // unread conversations, newest first
 
     // Stable per-workspace key (survives reordering; the store UUID also
     // survives renaming when pinned in workspaces.conf).
@@ -75,6 +76,13 @@ let safariVersion: String = {
     return "26.0"
 }()
 let safariUA = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/\(safariVersion) Safari/605.1.15"
+
+// A menu-bar inbox entry: which workspace, which conversation.
+final class InboxRef {
+    let ws: Workspace
+    let conv: String
+    init(ws: Workspace, conv: String) { self.ws = ws; self.conv = conv }
+}
 
 // Loads a Google service's own page once, top-level, in a hidden web view that
 // shares a workspace's data store, then discards itself. See warmUpCompanions.
@@ -461,9 +469,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKUIDelegate, WKNaviga
             for (var i = 0; i < rows.length; i++) {
               var r = rows[i], id = r.getAttribute('data-group-id');
               var ts = parseInt(r.getAttribute('data-display-timestamp'), 10) || 0;
-              var nm = /(\d+)\s+Notifications?/.exec(r.innerText || '');
-              var c = map[id] || (map[id] = { id: id, ts: 0, alerts: 0, name: '', text: '' });
+              var it = r.innerText || '';
+              var nm = /(\d+)\s+Notifications?/.exec(it);
+              var c = map[id] || (map[id] = { id: id, ts: 0, alerts: 0, name: '', text: '', unread: false });
               c.ts = Math.max(c.ts, ts);
+              // Unread rows: the Home list marks them data-is-unread="true"; the
+              // sidebar shows an "Unread" label (hidden, so not in innerText,
+              // when read).
+              if (r.getAttribute('data-is-unread') === 'true' || /\bUnread\b/.test(it)) c.unread = true;
               if (nm) c.alerts = Math.max(c.alerts, parseInt(nm[1], 10));
               var preview = r.querySelector('[jsname=ok3btb]');
               if (preview && !c.text) c.text = (preview.innerText || '').trim().slice(0, 300);
@@ -496,10 +509,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKUIDelegate, WKNaviga
               seen[id] = Math.max(prev || 0, c.ts);
             }
 
-            var key = unread + ':' + count;
+            // The unread conversations, newest first, for the menu-bar inbox.
+            var inbox = [];
+            for (var k in convs) if (convs[k].unread) inbox.push(convs[k]);
+            inbox.sort(function(a, b){ return b.ts - a.ts; });
+            inbox = inbox.slice(0, 20).map(function(c){
+              return { id: c.id, name: c.name, text: c.text, count: c.alerts };
+            });
+
+            var key = unread + ':' + count + ':' + inbox.map(function(c){
+              return c.id + '/' + c.count + '/' + c.text.length;
+            }).join(',');
             if (key !== last || messages.length) {
               last = key;
-              window.webkit.messageHandlers.badge.postMessage({ unread: unread, count: count, messages: messages });
+              window.webkit.messageHandlers.badge.postMessage(
+                { unread: unread, count: count, messages: messages, inbox: inbox });
             }
           }
           setInterval(check, 2000);
@@ -1523,6 +1547,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKUIDelegate, WKNaviga
         let count = (body?["count"] as? Int) ?? 0
         let messages = (body?["messages"] as? [[String: Any]]) ?? []
         if let ws = workspaces.first(where: { $0.webView === message.webView }) {
+            ws.inbox = ((body?["inbox"] as? [[String: Any]]) ?? []).compactMap { c in
+                guard let id = c["id"] as? String, !id.isEmpty else { return nil }
+                return (id, (c["name"] as? String) ?? "", (c["text"] as? String) ?? "", (c["count"] as? Int) ?? 0)
+            }
             let wasUnread = ws.unread, oldCount = ws.unreadCount
             ws.unread = unread
             ws.unreadCount = count
@@ -1710,18 +1738,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKUIDelegate, WKNaviga
             self.window.makeKeyAndOrderFront(nil)
             guard let ws = ws else { return }
             self.select(ws)
-            // Conversation ids look like "dm/y2-4eqAAAAE" or "space/AAQA..";
-            // checked before splicing into JS.
-            if let conv = info["conversation"] as? String,
-               conv.allSatisfy({ $0.isLetter || $0.isNumber || "/_-".contains($0) }) {
-                ws.webView.evaluateJavaScript("""
-                    (function(){
-                      var r = document.querySelector('[role=listitem][data-group-id="\(conv)"] [role=link]')
-                           || document.querySelector('[role=listitem][data-group-id="\(conv)"]');
-                      if (r) r.click();
-                    })();
-                    """)
-            }
+            if let conv = info["conversation"] as? String { self.openConversation(ws, conv) }
             // ids are "<ms>-<seq>" from the shim; checked before splicing into JS.
             if let id = info["pageID"] as? String, id.allSatisfy({ $0.isNumber || $0 == "-" }) {
                 let frame = self.notifFrames.removeValue(forKey: id)
@@ -1729,6 +1746,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKUIDelegate, WKNaviga
                                               in: frame, in: .page)
             }
         }
+    }
+
+    // Open a conversation by clicking its row (sidebar or Home list) in the page.
+    func openConversation(_ ws: Workspace, _ conv: String) {
+        ws.webView.callAsyncJavaScript(#"""
+            const sel = '[role=listitem][data-group-id="' + CSS.escape(conv) + '"]';
+            const row = document.querySelector(sel + ' [role=link]') || document.querySelector(sel);
+            if (row) row.click();
+            return !!row;
+            """#, arguments: ["conv": conv], in: nil, in: .page, completionHandler: nil)
     }
 
     // Reply from a banner: open the conversation, put the text in Chat's
@@ -1805,13 +1832,59 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKUIDelegate, WKNaviga
     func menuNeedsUpdate(_ menu: NSMenu) {
         guard menu === statusItem?.menu else { return }
         menu.removeAllItems()
-        workspaceMenu(into: menu)
+        inboxMenu(into: menu)
         menu.addItem(NSMenuItem.separator())
         menu.addItem(withTitle: "Open Chats", action: #selector(openFromMenuBar(_:)), keyEquivalent: "").target = self
         menu.addItem(withTitle: "Quit Chats", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "")
     }
 
     @objc func openFromMenuBar(_ sender: Any?) { showWindow() }
+
+    // The menu-bar inbox: each workspace (click to open it) followed by its
+    // unread conversations, newest first -- name, preview and count. Clicking
+    // one opens that conversation.
+    func inboxMenu(into menu: NSMenu) {
+        let nameFont = NSFont.menuFont(ofSize: 13)
+        let previewFont = NSFont.menuFont(ofSize: 11)
+        var any = false
+        for ws in workspaces {
+            let header = NSMenu()
+            workspaceMenu(into: header)
+            if let item = header.items.first(where: { $0.representedObject as? Workspace === ws }) {
+                header.removeItem(item)
+                item.attributedTitle = NSAttributedString(string: item.title, attributes: [
+                    .font: NSFont.boldSystemFont(ofSize: 13)])
+                menu.addItem(item)
+            }
+            for c in ws.inbox {
+                any = true
+                let title = NSMutableAttributedString(
+                    string: (c.name.isEmpty ? "Conversation" : c.name) + (c.count > 0 ? "  (\(c.count))" : ""),
+                    attributes: [.font: nameFont])
+                let preview = c.text.replacingOccurrences(of: "\n", with: " ")
+                if !preview.isEmpty {
+                    let short = preview.count > 60 ? String(preview.prefix(57)) + "\u{2026}" : preview
+                    title.append(NSAttributedString(string: "\n" + short, attributes: [
+                        .font: previewFont, .foregroundColor: NSColor.secondaryLabelColor]))
+                }
+                let item = menu.addItem(withTitle: c.name, action: #selector(openInboxItem(_:)), keyEquivalent: "")
+                item.attributedTitle = title
+                item.indentationLevel = 1
+                item.target = self
+                item.representedObject = InboxRef(ws: ws, conv: c.id)
+            }
+        }
+        if !any {
+            menu.addItem(NSMenuItem.separator())
+            menu.addItem(withTitle: "No unread messages", action: nil, keyEquivalent: "").isEnabled = false
+        }
+    }
+
+    @objc func openInboxItem(_ sender: NSMenuItem) {
+        guard let ref = sender.representedObject as? InboxRef else { return }
+        showWindow(ref.ws)
+        openConversation(ref.ws, ref.conv)
+    }
 
     func applicationShouldTerminateAfterLastWindowClosed(_ app: NSApplication) -> Bool { false }
 }
