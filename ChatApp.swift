@@ -49,6 +49,16 @@ final class Workspace {
     var inbox: [(id: String, name: String, text: String, count: Int)] = []   // unread conversations, newest first
     var watcher: WKWebView?           // hidden Home view, for previews (Settings > Message previews)
     var watcherReported = false       // watcher's first badge report seen (its baseline)
+    var watcherLastReport: Date?      // watcher's last badge report (it reports every 2 s while alive)
+
+    // The hidden Home view is reporting from a signed-in Chat page. While it is
+    // loading, off its host (signing in) or crash-looping, the visible view
+    // reports instead.
+    var watcherHealthy: Bool {
+        guard let w = watcher, let url = w.url, url.host == host, url.path.hasPrefix("/app/"),
+              let last = watcherLastReport else { return false }
+        return Date().timeIntervalSince(last) < 30
+    }
     var backgroundSince: Date?        // when it last left the screen, for "send back to Home"
     var markupMissing: Set<String> = []   // selectors already logged as not matching
     var crashes: [Date] = []          // recent web-process crashes, for reload backoff
@@ -685,7 +695,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKUIDelegate, WKNaviga
                ("Mute", #selector(muteIndefinitely(_:))),
                ("Unmute", #selector(unmute(_:))),
                ("", nil),
-               ("Quiet Hours (Evenings & Weekends)", #selector(toggleQuietHours(_:)))], into: notifMenu)
+               ("Quiet Hours", #selector(toggleQuietHours(_:)))], into: notifMenu)
         menu.addItem(withTitle: "Notifications", action: nil, keyEquivalent: "").submenu = notifMenu
         return menu
     }
@@ -755,10 +765,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKUIDelegate, WKNaviga
     @objc func muteHour(_ sender: NSMenuItem) { setMute(sender, until: Date().addingTimeInterval(3600)) }
     @objc func muteIndefinitely(_ sender: NSMenuItem) { setMute(sender, until: .distantFuture) }
     @objc func unmute(_ sender: NSMenuItem) { setMute(sender, until: nil) }
+    // Until 08:00 tomorrow -- a fixed morning, not the quiet-hours end (with a
+    // 09:00-17:00 range that would be 17:00 tomorrow).
     @objc func muteTomorrow(_ sender: NSMenuItem) {
         let cal = Calendar.current
         let tomorrow = cal.date(byAdding: .day, value: 1, to: cal.startOfDay(for: Date()))!
-        setMute(sender, until: cal.date(bySettingHour: quietHours.end, minute: 0, second: 0, of: tomorrow))
+        setMute(sender, until: cal.date(bySettingHour: 8, minute: 0, second: 0, of: tomorrow))
     }
 
     @objc func toggleQuietHours(_ sender: NSMenuItem) {
@@ -877,9 +889,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKUIDelegate, WKNaviga
 
     // A reload starts the unread probe from scratch; treat its first report as
     // the baseline again so a reload never raises a banner for old unread.
-    func reload(_ ws: Workspace) {
+    func reload(_ ws: Workspace, watcherToo: Bool = true) {
         ws.unreadReported = false
         ws.webView.reload()
+        guard watcherToo else { return }
         ws.watcherReported = false
         ws.watcher?.reload()
     }
@@ -895,7 +908,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKUIDelegate, WKNaviga
     @objc func toggleLaunchAtLogin(_ sender: Any?) {
         let service = SMAppService.mainApp
         do {
-            if service.status == .enabled { try service.unregister() } else { try service.register() }
+            // Registered (also while awaiting approval in System Settings): turn off.
+            if service.status == .notRegistered || service.status == .notFound {
+                try service.register()
+            } else {
+                try service.unregister()
+            }
         } catch {
             let alert = NSAlert(error: error)
             alert.informativeText = "You can add Chats in System Settings > General > Login Items."
@@ -1026,7 +1044,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKUIDelegate, WKNaviga
             if self.offlineSince != nil { self.reloadWhenOnline = true; return }
             if !force, let last = self.lastFullReload, Date().timeIntervalSince(last) < 60 { return }
             self.lastFullReload = Date()
-            self.workspaces.forEach(self.reload)
+            self.workspaces.forEach { self.reload($0) }
         }
     }
 
@@ -1052,7 +1070,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKUIDelegate, WKNaviga
                 ws.watcherReported = false
                 webView.reload()
             } else {
-                self?.reload(ws)
+                self?.reload(ws, watcherToo: false)
             }
         }
     }
@@ -1311,6 +1329,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKUIDelegate, WKNaviga
 
     @objc func settingsReplyChanged(_ sender: NSButton) {
         UserDefaults.standard.set(sender.state == .on, forKey: "ReplySendsImmediately")
+        registerNotificationCategories()
     }
 
     @objc func settingsInspectorChanged(_ sender: NSButton) {
@@ -1677,17 +1696,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKUIDelegate, WKNaviga
         let count = (body?["count"] as? Int) ?? 0
         let messages = (body?["messages"] as? [[String: Any]]) ?? []
         let fromWatcher = workspaces.contains { $0.watcher === message.webView }
-        // With a hidden Home view, it alone reports for its workspace -- counts,
-        // inbox and banners -- since it always has previews. The visible view's
-        // reports are ignored; if both wrote the same counts, whichever came
-        // second would see no change and the fallback banner could be lost.
-        if !fromWatcher, workspaces.contains(where: { $0.watcher != nil && $0.webView === message.webView }) { return }
+        // With a healthy hidden Home view, it alone reports for its workspace --
+        // counts, inbox and banners -- since it always has previews. The visible
+        // view's reports are ignored then; if both wrote the same counts,
+        // whichever came second would see no change and the fallback banner
+        // could be lost. While the hidden view is unhealthy, the visible one
+        // reports, so the workspace never goes silent.
+        if fromWatcher, let ws = workspaces.first(where: { $0.watcher === message.webView }) {
+            ws.watcherLastReport = Date()
+        }
+        if !fromWatcher, workspaces.contains(where: { $0.watcherHealthy && $0.webView === message.webView }) { return }
         if let ws = workspaces.first(where: { $0.webView === message.webView || $0.watcher === message.webView }) {
             ws.inbox = ((body?["inbox"] as? [[String: Any]]) ?? []).compactMap { c in
                 guard let id = c["id"] as? String, !id.isEmpty else { return nil }
                 return (id, (c["name"] as? String) ?? "", (c["text"] as? String) ?? "", (c["count"] as? Int) ?? 0)
             }
-            checkMarkup(ws, body?["health"] as? [String: Any], unread: unread)
+            checkMarkup(ws, body?["health"] as? [String: Any], page: message.webView)
             let wasUnread = ws.unread, oldCount = ws.unreadCount
             ws.unread = unread
             ws.unreadCount = count
@@ -1706,9 +1730,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKUIDelegate, WKNaviga
 
     // Log (once, and again on recovery) when a selector the app depends on
     // stops matching on a signed-in Chat page.
-    func checkMarkup(_ ws: Workspace, _ health: [String: Any]?, unread: Bool) {
-        guard let health = health, ws.webView.url?.host == ws.host,
-              ws.webView.url?.path.hasPrefix("/app/") == true else { return }
+    func checkMarkup(_ ws: Workspace, _ health: [String: Any]?, page: WKWebView?) {
+        guard let health = health, let url = (page ?? ws.webView).url, url.host == ws.host,
+              url.path.hasPrefix("/app/") else { return }
         let checks = [("conversation rows ([role=listitem][data-group-id][data-display-timestamp])",
                        (health["rows"] as? Int ?? 0) > 0),
                       ("Home unread label ([aria-label^=\"Home shortcut\"])", health["home"] as? Bool ?? false)]
@@ -1726,12 +1750,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKUIDelegate, WKNaviga
 
     // Reply and Mark as Read on message banners. Reply brings the app forward
     // (Chat only opens a conversation while its page is on screen) and types
-    // the reply for you to send, so its button says "Type Reply", not "Send".
+    // the reply for you to send, so its button says "Type Reply" -- or "Send"
+    // when Settings has replies sent immediately.
     func registerNotificationCategories() {
         UNUserNotificationCenter.current().setNotificationCategories([UNNotificationCategory(
             identifier: "MESSAGE",
             actions: [UNTextInputNotificationAction(identifier: "REPLY", title: "Reply", options: [.foreground],
-                                                    textInputButtonTitle: "Type Reply",
+                                                    textInputButtonTitle: replySendsImmediately ? "Send" : "Type Reply",
                                                     textInputPlaceholder: "Reply"),
                       UNNotificationAction(identifier: "MARK_READ", title: "Mark as Read", options: [])],
             intentIdentifiers: [], options: [])])
