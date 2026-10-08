@@ -49,6 +49,9 @@ final class Workspace {
     var lastBanner: [String: (text: String, at: Date)] = [:]   // per conversation, for de-duplication
     var configIndex = 0               // position in workspaces.conf, for the default colour
     var inbox: [(id: String, name: String, text: String, count: Int)] = []   // unread conversations, newest first
+    var watcher: WKWebView?           // hidden Home view, for previews (Settings > Message previews)
+    var watcherReported = false       // watcher's first badge report seen (its baseline)
+    var backgroundSince: Date?        // when it last left the screen, for "send back to Home"
 
     // Stable per-workspace key (survives reordering; the store UUID also
     // survives renaming when pinned in workspaces.conf).
@@ -230,6 +233,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKUIDelegate, WKNaviga
         appMenu.addItem(withTitle: "Show All",
                         action: #selector(NSApplication.unhideAllApplications(_:)), keyEquivalent: "")
         appMenu.addItem(NSMenuItem.separator())
+        appMenu.addItem(withTitle: "Settings\u{2026}", action: #selector(showSettings(_:)), keyEquivalent: ",").target = self
+        appMenu.addItem(NSMenuItem.separator())
         for (title, action) in [("Launch at Login", #selector(toggleLaunchAtLogin(_:))),
                                 ("Show in Menu Bar", #selector(toggleMenuBarIcon(_:)))] {
             appMenu.addItem(withTitle: title, action: action, keyEquivalent: "").target = self
@@ -389,6 +394,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKUIDelegate, WKNaviga
         }
         // Refresh mute/quiet-hours state on the rail, menu bar and Dock.
         Timer.scheduledTimer(withTimeInterval: 60, repeats: true) { [weak self] _ in self?.updateBadges() }
+        Timer.scheduledTimer(withTimeInterval: 30, repeats: true) { [weak self] _ in self?.sendBackgroundWorkspacesHome() }
+        applyPreviewMode()
 
         // Esc closes a focused popup window even if the web content (e.g. a bare
         // image page) would otherwise swallow the keystroke. A local monitor sees
@@ -777,12 +784,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKUIDelegate, WKNaviga
     var systemIsDark: Bool { UserDefaults.standard.string(forKey: "AppleInterfaceStyle") == "Dark" }
 
     func applyAppearance() {
+        defer { refreshSettings() }
         let choice = UserDefaults.standard.integer(forKey: "AppAppearance")   // 0 system, 1 light, 2 dark
         NSApp.appearance = choice == 1 ? NSAppearance(named: .aqua)
             : choice == 2 ? NSAppearance(named: .darkAqua) : nil
         let dark = choice == 2 || (choice == 0 && systemIsDark)
         let system = NSAppearance(named: systemIsDark ? .darkAqua : .aqua)
-        for ws in workspaces { ws.webView.appearance = system }
+        for ws in workspaces { ws.webView.appearance = system; ws.watcher?.appearance = system }
         for win in popupWindows { win.contentView?.appearance = system }
         let rail = NSColor(calibratedWhite: dark ? 0.12 : 0.88, alpha: 1).cgColor
         railView?.layer?.backgroundColor = rail
@@ -1014,6 +1022,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKUIDelegate, WKNaviga
     func reload(_ ws: Workspace) {
         ws.unreadReported = false
         ws.webView.reload()
+        ws.watcherReported = false
+        ws.watcher?.reload()
     }
 
     // MARK: - Search, global shortcut, launch at login, menu bar
@@ -1101,6 +1111,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKUIDelegate, WKNaviga
             alert.runModal()
         }
         if service.status == .requiresApproval { SMAppService.openSystemSettingsLoginItems() }
+        refreshSettings()
     }
 
     @objc func toggleMenuBarIcon(_ sender: Any?) {
@@ -1111,6 +1122,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKUIDelegate, WKNaviga
             installStatusItem()
         }
         UserDefaults.standard.set(statusItem != nil, forKey: "ShowMenuBarIcon")
+        refreshSettings()
     }
 
     func installStatusItem() {
@@ -1227,6 +1239,194 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKUIDelegate, WKNaviga
     // rather than leave a blank workspace.
     func webViewWebContentProcessDidTerminate(_ webView: WKWebView) {
         if let ws = workspaces.first(where: { $0.webView === webView }) { reload(ws) }
+        if let ws = workspaces.first(where: { $0.watcher === webView }) {
+            ws.watcherReported = false
+            webView.reload()
+        }
+    }
+
+    // MARK: - Message previews
+
+    // Banner previews come from Chat's Home list, which is only on the page
+    // while a workspace shows Home; the sidebar (always there) has names and
+    // counts but no text. Settings > Message previews picks how to cope:
+    //   0  only while a workspace is on Home (default)
+    //   1  reload a workspace to Home once it has been off screen for N minutes
+    //   2  keep a hidden second web view per workspace that stays on Home
+    var previewMode: Int { UserDefaults.standard.integer(forKey: "PreviewMode") }
+    var returnHomeMinutes: Int { UserDefaults.standard.object(forKey: "ReturnHomeMinutes") as? Int ?? 5 }
+
+    func applyPreviewMode() {
+        for ws in workspaces {
+            if previewMode == 2, ws.watcher == nil {
+                // Same data store (same sign-in), same scripts and delegates;
+                // kept hidden at the bottom of the window's view stack.
+                let wv = makeWebView(for: ws)
+                wv.frame = container.bounds
+                wv.autoresizingMask = [.width, .height]
+                wv.isHidden = true
+                container.addSubview(wv, positioned: .below, relativeTo: nil)
+                wv.appearance = ws.webView.appearance
+                ws.watcher = wv
+                ws.watcherReported = false
+                wv.load(URLRequest(url: ws.url))
+            } else if previewMode != 2, let wv = ws.watcher {
+                wv.removeFromSuperview()
+                ws.watcher = nil
+            }
+        }
+    }
+
+    // Mode 1: a workspace that has been off screen (not the one shown, or the
+    // app in the background) for N minutes and is not on Home is reloaded to
+    // Home. A full load, not a click: Chat's in-page router may not act while
+    // its page is hidden.
+    func sendBackgroundWorkspacesHome() {
+        for ws in workspaces {
+            if ws === current && window.isVisible && NSApp.isActive {
+                ws.backgroundSince = nil
+                continue
+            }
+            let since = ws.backgroundSince ?? Date()
+            ws.backgroundSince = since
+            guard previewMode == 1, Date().timeIntervalSince(since) >= Double(returnHomeMinutes) * 60,
+                  let path = ws.webView.url?.path, path != "/", !path.hasSuffix("/app/home") else { continue }
+            ws.unreadReported = false
+            ws.webView.load(URLRequest(url: ws.url))
+        }
+    }
+
+    // MARK: - Settings window
+
+    var settingsWindow: NSWindow?
+    var settingsControls: [String: NSControl] = [:]
+    var previewHelp: NSTextField?
+
+    static let previewHelpText = [
+        "Previews appear while that workspace is on Chat's Home view. Otherwise banners show the sender and \u{201C}New message\u{201D}.",
+        "A workspace you haven't looked at for a while reloads to Home, so previews keep coming. Switching back lands you on Home instead of the conversation you left.",
+        "Each workspace keeps an invisible copy of Chat on Home, used only for previews; your view stays where you left it. Uses more memory -- about one more Chat page per workspace.",
+    ]
+
+    @objc func showSettings(_ sender: Any?) {
+        if settingsWindow == nil { buildSettingsWindow() }
+        refreshSettings()
+        NSApp.activate(ignoringOtherApps: true)
+        settingsWindow?.makeKeyAndOrderFront(nil)
+    }
+
+    func buildSettingsWindow() {
+        func label(_ text: String) -> NSTextField {
+            let l = NSTextField(labelWithString: text)
+            l.alignment = .right
+            return l
+        }
+        func note(_ text: String) -> NSTextField {
+            let l = NSTextField(wrappingLabelWithString: text)
+            l.font = .systemFont(ofSize: NSFont.smallSystemFontSize)
+            l.textColor = .secondaryLabelColor
+            l.preferredMaxLayoutWidth = 340
+            return l
+        }
+        func popup(_ key: String, _ titles: [String], tags: [Int]? = nil, _ action: Selector) -> NSPopUpButton {
+            let p = NSPopUpButton()
+            for (i, t) in titles.enumerated() {
+                p.addItem(withTitle: t)
+                p.lastItem?.tag = tags?[i] ?? i
+            }
+            p.target = self
+            p.action = action
+            settingsControls[key] = p
+            return p
+        }
+        func check(_ key: String, _ title: String, _ action: Selector) -> NSButton {
+            let b = NSButton(checkboxWithTitle: title, target: self, action: action)
+            settingsControls[key] = b
+            return b
+        }
+        let hours = (0..<24).map { String(format: "%02d:00", $0) }
+        let help = note("")
+        previewHelp = help
+        let quiet = NSStackView(views: [
+            popup("quietStart", hours, #selector(settingsQuietChanged(_:))),
+            NSTextField(labelWithString: "to"),
+            popup("quietEnd", hours, #selector(settingsQuietChanged(_:))),
+        ])
+        let empty = NSGridCell.emptyContentView
+        let grid = NSGridView(views: [
+            [label("Appearance:"), popup("appearance", ["System", "Light", "Dark"], #selector(settingsAppearanceChanged(_:)))],
+            [empty, check("menuBar", "Show unread inbox in the menu bar", #selector(toggleMenuBarIcon(_:)))],
+            [empty, check("login", "Launch Chats at login", #selector(toggleLaunchAtLogin(_:)))],
+            [label("Message previews:"), popup("preview", ["Only while a workspace is on Home",
+                                                           "Send background workspaces back to Home",
+                                                           "Keep a hidden Home view per workspace"],
+                                               #selector(settingsPreviewChanged(_:)))],
+            [empty, help],
+            [label("Back to Home after:"), popup("minutes", [1, 2, 5, 10, 15, 30].map { "\($0) minutes" },
+                                                 tags: [1, 2, 5, 10, 15, 30], #selector(settingsPreviewChanged(_:)))],
+            [label("Quiet hours:"), quiet],
+            [empty, note("Weekdays in this range, and all weekend. Turn quiet hours on per workspace: right-click its button \u{203A} Notifications.")],
+        ])
+        grid.column(at: 0).xPlacement = .trailing
+        grid.rowAlignment = .firstBaseline
+        grid.rowSpacing = 10
+        grid.columnSpacing = 8
+        grid.row(at: 3).topPadding = 14
+        grid.row(at: 6).topPadding = 14
+        grid.translatesAutoresizingMaskIntoConstraints = false
+
+        let content = NSView()
+        content.addSubview(grid)
+        NSLayoutConstraint.activate([
+            grid.topAnchor.constraint(equalTo: content.topAnchor, constant: 20),
+            grid.bottomAnchor.constraint(equalTo: content.bottomAnchor, constant: -20),
+            grid.leadingAnchor.constraint(equalTo: content.leadingAnchor, constant: 20),
+            grid.trailingAnchor.constraint(equalTo: content.trailingAnchor, constant: -20),
+        ])
+        let win = NSWindow(contentRect: .zero, styleMask: [.titled, .closable], backing: .buffered, defer: false)
+        win.title = "Settings"
+        win.contentView = content
+        win.isReleasedWhenClosed = false
+        win.center()
+        settingsWindow = win
+    }
+
+    // Load every control from the current settings (they can also change from
+    // the menus).
+    func refreshSettings() {
+        let d = UserDefaults.standard
+        (settingsControls["appearance"] as? NSPopUpButton)?.selectItem(withTag: d.integer(forKey: "AppAppearance"))
+        (settingsControls["menuBar"] as? NSButton)?.state = statusItem != nil ? .on : .off
+        (settingsControls["login"] as? NSButton)?.state = SMAppService.mainApp.status == .enabled ? .on : .off
+        (settingsControls["preview"] as? NSPopUpButton)?.selectItem(withTag: previewMode)
+        (settingsControls["minutes"] as? NSPopUpButton)?.selectItem(withTag: returnHomeMinutes)
+        settingsControls["minutes"]?.isEnabled = previewMode == 1
+        (settingsControls["quietStart"] as? NSPopUpButton)?.selectItem(withTag: quietHours.start)
+        (settingsControls["quietEnd"] as? NSPopUpButton)?.selectItem(withTag: quietHours.end)
+        previewHelp?.stringValue = Self.previewHelpText[min(previewMode, 2)]
+        if let win = settingsWindow, let content = win.contentView {
+            win.setContentSize(content.fittingSize)
+        }
+    }
+
+    @objc func settingsAppearanceChanged(_ sender: NSPopUpButton) {
+        UserDefaults.standard.set(sender.selectedTag(), forKey: "AppAppearance")
+        applyAppearance()
+    }
+
+    @objc func settingsPreviewChanged(_ sender: NSPopUpButton) {
+        let d = UserDefaults.standard
+        if let p = settingsControls["preview"] as? NSPopUpButton { d.set(p.selectedTag(), forKey: "PreviewMode") }
+        if let m = settingsControls["minutes"] as? NSPopUpButton { d.set(m.selectedTag(), forKey: "ReturnHomeMinutes") }
+        applyPreviewMode()
+        refreshSettings()
+    }
+
+    @objc func settingsQuietChanged(_ sender: NSPopUpButton) {
+        let d = UserDefaults.standard
+        if let p = settingsControls["quietStart"] as? NSPopUpButton { d.set(p.selectedTag(), forKey: "QuietHoursStart") }
+        if let p = settingsControls["quietEnd"] as? NSPopUpButton { d.set(p.selectedTag(), forKey: "QuietHoursEnd") }
+        updateBadges()
     }
 
     // MARK: - Side-panel companions (Calendar)
@@ -1565,10 +1765,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKUIDelegate, WKNaviga
         let unread = (body?["unread"] as? Bool) ?? false
         let count = (body?["count"] as? Int) ?? 0
         let messages = (body?["messages"] as? [[String: Any]]) ?? []
-        if let ws = workspaces.first(where: { $0.webView === message.webView }) {
-            ws.inbox = ((body?["inbox"] as? [[String: Any]]) ?? []).compactMap { c in
+        let fromWatcher = workspaces.contains { $0.watcher === message.webView }
+        // With a hidden Home view per workspace, it alone drives banners and the
+        // inbox (it always has previews); the visible view only updates counts.
+        let drivesNotifications = fromWatcher || !workspaces.contains { $0.watcher != nil && $0.webView === message.webView }
+        if let ws = workspaces.first(where: { $0.webView === message.webView || $0.watcher === message.webView }) {
+            if drivesNotifications {
+                ws.inbox = ((body?["inbox"] as? [[String: Any]]) ?? []).compactMap { c in
                 guard let id = c["id"] as? String, !id.isEmpty else { return nil }
-                return (id, (c["name"] as? String) ?? "", (c["text"] as? String) ?? "", (c["count"] as? Int) ?? 0)
+                    return (id, (c["name"] as? String) ?? "", (c["text"] as? String) ?? "", (c["count"] as? Int) ?? 0)
+                }
             }
             let wasUnread = ws.unread, oldCount = ws.unreadCount
             ws.unread = unread
@@ -1578,9 +1784,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKUIDelegate, WKNaviga
             // conversation it was in; otherwise a generic one when unread starts
             // or the count goes up. Skip the first report: that is the unread
             // state at launch, not news.
-            for m in messages { notifyMessage(ws, m) }
-            if ws.unreadReported && (unread != wasUnread || count > oldCount) { notifyUnread(ws) }
-            ws.unreadReported = true
+            if drivesNotifications {
+                let reported = fromWatcher ? ws.watcherReported : ws.unreadReported
+                for m in messages { notifyMessage(ws, m) }
+                if reported && (unread != wasUnread || count > oldCount) { notifyUnread(ws) }
+            }
+            if fromWatcher { ws.watcherReported = true } else { ws.unreadReported = true }
         }
         updateBadges()
     }

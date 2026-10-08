@@ -36,6 +36,12 @@ Xcode project, no dependencies.
   preview and count, newest first, grouped by workspace -- and clicking one
   opens it. The Dock icon's right-click menu lists the same, one line each. Toggle
   the icon under Chats > Show in Menu Bar.
+- **Settings** (Chats > Settings..., Cmd+,): appearance, menu-bar inbox, launch
+  at login, quiet-hours times, and how to get **message previews**. Previews
+  come from Chat's Home list, which is only on the page while a workspace shows
+  Home (the sidebar has names and counts, not text), so choose: only while on
+  Home (default); send background workspaces back to Home after N minutes; or
+  keep a hidden Home view per workspace (previews everywhere, more memory).
 - **Launch at Login** under the Chats menu.
 - **Keyboard shortcuts**: Cmd+1..9 switch workspace, Cmd+Shift+[ / ] step
   through them, Cmd+N starts a new chat (Chat's people picker), Cmd+F
