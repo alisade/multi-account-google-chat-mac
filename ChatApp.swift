@@ -1,7 +1,9 @@
+import Carbon.HIToolbox
 import Cocoa
 import Network
 import ServiceManagement
 import os
+import UniformTypeIdentifiers
 import UserNotifications
 import WebKit
 
@@ -46,6 +48,7 @@ final class Workspace {
     var unreadReported = false        // first badge report seen (startup state)
     var lastPageNotification: Date?   // last banner raised by the page itself
     var lastBanner: [String: (text: String, count: Int, at: Date)] = [:]   // per conversation, for de-duplication
+    var configIndex = 0               // position in workspaces.conf, for the default colour
     var inbox: [(id: String, name: String, text: String, count: Int)] = []   // unread conversations, newest first
     var watcher: WKWebView?           // hidden Home view, for previews (Settings > Message previews)
     var watcherReported = false       // watcher's first badge report seen (its baseline)
@@ -153,7 +156,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKUIDelegate, WKNaviga
     var railContent: FlippedView?
     var downloads: [WKDownload: URL] = [:]   // in-flight download -> destination
     var notifFrames: [String: WKFrameInfo] = [:]   // page notification id -> frame that raised it
+    var accentBar: NSView?                 // strip across the top in the current workspace's colour
     var statusItem: NSStatusItem?          // menu-bar icon
+    var hotKeyRef: EventHotKeyRef?         // global show/hide shortcut
+    var hotKeyRegistered = false
     var pathMonitor: NWPathMonitor?
     var offlineSince: Date?
     var asleepSince: Date?
@@ -171,7 +177,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKUIDelegate, WKNaviga
     // from "AppStartURL" (the classic single-site app).
     func loadWorkspaces() -> [Workspace] {
         if let arr = Bundle.main.object(forInfoDictionaryKey: "Workspaces") as? [[String: Any]], !arr.isEmpty {
-            return arr.compactMap { d in
+            let list: [Workspace] = arr.compactMap { d in
                 guard let name = d["Name"] as? String,
                       let urlStr = d["URL"] as? String,
                       let url = URL(string: urlStr) else { return nil }
@@ -180,10 +186,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKUIDelegate, WKNaviga
                 ws.iconFile = d["Icon"] as? String
                 return ws
             }
+            for (i, ws) in list.enumerated() { ws.configIndex = i }
+            return list
         }
         let s = (Bundle.main.object(forInfoDictionaryKey: "AppStartURL") as? String) ?? "https://chat.google.com/"
         let name = (Bundle.main.object(forInfoDictionaryKey: "CFBundleName") as? String) ?? "Chat"
         return [Workspace(name: name, url: URL(string: s)!)]
+    }
+
+    // The rail order the user picked (right-click > Move Up/Down), by workspace
+    // key. Workspaces not in the saved list (e.g. newly added to the config)
+    // keep their config order after the saved ones.
+    func applySavedOrder(_ list: [Workspace]) -> [Workspace] {
+        let saved = UserDefaults.standard.stringArray(forKey: "WorkspaceOrder") ?? []
+        let rank = Dictionary(saved.enumerated().map { ($1, $0) }, uniquingKeysWith: { a, _ in a })
+        return list.enumerated().sorted { a, b in
+            (rank[a.element.key] ?? saved.count + a.offset) < (rank[b.element.key] ?? saved.count + b.offset)
+        }.map { $0.element }
     }
 
     // A link is "external" (open in the default browser) unless it belongs to a
@@ -246,12 +265,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKUIDelegate, WKNaviga
                                 ("Show in Menu Bar", #selector(toggleMenuBarIcon(_:)))] {
             appMenu.addItem(withTitle: title, action: action, keyEquivalent: "").target = self
         }
+        let hotKeyInfo = appMenu.addItem(
+            withTitle: hotKeyRegistered ? "Show/Hide from Anywhere: \u{2303}\u{2325}C"
+                                        : "Show/Hide from Anywhere: \u{2303}\u{2325}C is in use by another app",
+            action: nil, keyEquivalent: "")
+        hotKeyInfo.isEnabled = false
         appMenu.addItem(NSMenuItem.separator())
         appMenu.addItem(withTitle: "Send Test Notification",
                         action: #selector(sendTestNotification(_:)), keyEquivalent: "")
         appMenu.addItem(NSMenuItem.separator())
         appMenu.addItem(withTitle: "Quit \(appName)",
                         action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
+
+        let fileItem = NSMenuItem()
+        mainMenu.addItem(fileItem)
+        let fileMenu = NSMenu(title: "File")
+        fileItem.submenu = fileMenu
+        fileMenu.addItem(withTitle: "New Chat", action: #selector(newChat(_:)), keyEquivalent: "n").target = self
 
         let editItem = NSMenuItem()
         mainMenu.addItem(editItem)
@@ -265,6 +295,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKUIDelegate, WKNaviga
         editMenu.addItem(withTitle: "Copy", action: #selector(NSText.copy(_:)), keyEquivalent: "c")
         editMenu.addItem(withTitle: "Paste", action: #selector(NSText.paste(_:)), keyEquivalent: "v")
         editMenu.addItem(withTitle: "Select All", action: #selector(NSText.selectAll(_:)), keyEquivalent: "a")
+        editMenu.addItem(NSMenuItem.separator())
+        // Cmd+F, not Cmd+K: in Chat's message box Cmd+K inserts a link.
+        editMenu.addItem(withTitle: "Search Chat", action: #selector(focusSearch(_:)), keyEquivalent: "f").target = self
 
         let viewItem = NSMenuItem()
         mainMenu.addItem(viewItem)
@@ -277,11 +310,31 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKUIDelegate, WKNaviga
             item.target = self
             item.tag = tag
         }
+        add(viewMenu, "Reload", #selector(reloadPage(_:)), "r")
+        viewMenu.addItem(NSMenuItem.separator())
+        add(viewMenu, "Actual Size", #selector(zoomReset(_:)), "0")
+        add(viewMenu, "Zoom In", #selector(zoomIn(_:)), "=")
+        add(viewMenu, "Zoom Out", #selector(zoomOut(_:)), "-")
+        viewMenu.addItem(NSMenuItem.separator())
         let appearanceMenu = NSMenu()
         for (i, title) in ["System", "Light", "Dark"].enumerated() {
             add(appearanceMenu, title, #selector(setAppAppearance(_:)), "", tag: i)
         }
         viewMenu.addItem(withTitle: "Appearance", action: nil, keyEquivalent: "").submenu = appearanceMenu
+
+        // Cmd+1..9 jump to a workspace, as in Slack and browser tabs.
+        if workspaces.count > 1 {
+            let wsItem = NSMenuItem()
+            mainMenu.addItem(wsItem)
+            let wsMenu = NSMenu(title: "Workspace")
+            wsItem.submenu = wsMenu
+            for (i, ws) in workspaces.enumerated() {
+                add(wsMenu, ws.name, #selector(selectWorkspaceFromMenu(_:)), i < 9 ? "\(i + 1)" : "", tag: i)
+            }
+            wsMenu.addItem(NSMenuItem.separator())
+            add(wsMenu, "Next Workspace", #selector(nextWorkspace(_:)), "]", [.command, .shift])
+            add(wsMenu, "Previous Workspace", #selector(previousWorkspace(_:)), "[", [.command, .shift])
+        }
 
         let windowItem = NSMenuItem()
         mainMenu.addItem(windowItem)
@@ -299,7 +352,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKUIDelegate, WKNaviga
     // MARK: - Launch
 
     func applicationDidFinishLaunching(_ note: Notification) {
-        workspaces = loadWorkspaces()
+        workspaces = applySavedOrder(loadWorkspaces())
         setupMainMenu()
         appHosts = Set(workspaces.map { $0.host }.filter { !$0.isEmpty })
         if appHosts.isEmpty { appHosts = ["chat.google.com"] }
@@ -338,12 +391,28 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKUIDelegate, WKNaviga
             container.addSubview(wv)
             wv.load(URLRequest(url: ws.url))
         }
-        if let first = workspaces.first { select(first) }
+        // Keyed like order, colour and logo (ws.key), so renaming a workspace
+        // with a pinned store UUID keeps it; older builds saved the name.
+        let last = UserDefaults.standard.string(forKey: "LastWorkspaceKey")
+        let lastName = UserDefaults.standard.string(forKey: "LastWorkspace")
+        if let ws = workspaces.first(where: { $0.key == last }) ?? workspaces.first(where: { $0.name == lastName })
+            ?? workspaces.first { select(ws) }
+
+        // Accent strip across the top of the page, in the current workspace's
+        // colour, so it is obvious which account you are typing into.
+        let bar = NSView(frame: NSRect(x: 0, y: container.bounds.height - 3, width: container.bounds.width, height: 3))
+        bar.autoresizingMask = [.width, .minYMargin]
+        bar.wantsLayer = true
+        bar.isHidden = !multi
+        container.addSubview(bar)
+        accentBar = bar
+        if let ws = current { select(ws) }   // paint the accent now that the bar exists
 
         window.center()
         window.makeKeyAndOrderFront(nil)
 
         if UserDefaults.standard.object(forKey: "ShowMenuBarIcon") as? Bool ?? true { installStatusItem() }
+        registerGlobalHotKey()
         applyAppearance()
         DistributedNotificationCenter.default().addObserver(
             forName: Notification.Name("AppleInterfaceThemeChangedNotification"), object: nil, queue: .main
@@ -614,6 +683,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKUIDelegate, WKNaviga
         wv.allowsBackForwardNavigationGestures = true
         // Settings > Advanced: Safari > Develop > Chats lists each page.
         wv.isInspectable = UserDefaults.standard.bool(forKey: "WebInspector")
+        let d = UserDefaults.standard
+        let zoom = d.object(forKey: "Zoom.\(ws.key)") as? Double ?? d.double(forKey: "Zoom.\(ws.name)")
+        if zoom > 0 { wv.pageZoom = zoom }
         return wv
     }
 
@@ -689,6 +761,25 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKUIDelegate, WKNaviga
                 item.representedObject = ws
             }
         }
+        items([("Move Up", #selector(moveWorkspaceUp(_:))),
+               ("Move Down", #selector(moveWorkspaceDown(_:))),
+               ("", nil),
+               ("Change Logo\u{2026}", #selector(changeLogo(_:))),
+               ("Reset Logo", #selector(resetLogo(_:))),
+               ("", nil)], into: menu)
+
+        let colorMenu = NSMenu()
+        for (i, c) in Self.palette.enumerated() {
+            let item = colorMenu.addItem(withTitle: c.name, action: #selector(setAccent(_:)), keyEquivalent: "")
+            item.target = self
+            item.representedObject = ws
+            item.tag = i
+            item.image = NSImage(size: NSSize(width: 12, height: 12), flipped: false) { r in
+                c.color.setFill(); NSBezierPath(ovalIn: r).fill(); return true
+            }
+        }
+        menu.addItem(withTitle: "Color", action: nil, keyEquivalent: "").submenu = colorMenu
+
         let notifMenu = NSMenu()
         items([("Mute for 1 Hour", #selector(muteHour(_:))),
                ("Mute Until Tomorrow", #selector(muteTomorrow(_:))),
@@ -713,9 +804,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKUIDelegate, WKNaviga
             return true
         default: break
         }
-        guard let ws = item.representedObject as? Workspace else { return true }
+        guard let ws = item.representedObject as? Workspace,
+              let i = workspaces.firstIndex(where: { $0 === ws }) else { return true }
         let d = UserDefaults.standard
         switch item.action {
+        case #selector(moveWorkspaceUp(_:)): return i > 0
+        case #selector(moveWorkspaceDown(_:)): return i < workspaces.count - 1
+        case #selector(resetLogo(_:)): return FileManager.default.fileExists(atPath: customLogoURL(ws).path)
+        case #selector(setAccent(_:)):
+            item.state = accentIndex(ws) == item.tag ? .on : .off
+            return true
         case #selector(unmute(_:)):
             return (d.object(forKey: "MuteUntil.\(ws.key)") as? Date).map { $0 > Date() } ?? false
         case #selector(muteIndefinitely(_:)):
@@ -752,6 +850,29 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKUIDelegate, WKNaviga
         let rail = NSColor(calibratedWhite: dark ? 0.12 : 0.88, alpha: 1).cgColor
         railView?.layer?.backgroundColor = rail
         for ws in workspaces { ws.dot?.layer?.borderColor = rail }
+    }
+
+    // MARK: - Accent colours
+
+    static let palette: [(name: String, color: NSColor)] = [
+        ("Blue", .systemBlue), ("Green", .systemGreen), ("Orange", .systemOrange),
+        ("Purple", .systemPurple), ("Pink", .systemPink), ("Teal", .systemTeal),
+        ("Red", .systemRed), ("Yellow", .systemYellow),
+    ]
+
+    // Saved choice (right-click > Color), else a distinct default per position
+    // in workspaces.conf.
+    func accentIndex(_ ws: Workspace) -> Int {
+        let saved = UserDefaults.standard.object(forKey: "Accent.\(ws.key)") as? Int
+        return abs(saved ?? ws.configIndex) % Self.palette.count
+    }
+
+    func accent(_ ws: Workspace) -> NSColor { Self.palette[accentIndex(ws)].color }
+
+    @objc func setAccent(_ sender: NSMenuItem) {
+        guard let ws = sender.representedObject as? Workspace else { return }
+        UserDefaults.standard.set(sender.tag, forKey: "Accent.\(ws.key)")
+        if let cur = current { select(cur) }
     }
 
     // MARK: - Mute and quiet hours
@@ -806,6 +927,61 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKUIDelegate, WKNaviga
         return start < end ? (hour >= start && hour < end) : (hour >= start || hour < end)
     }
 
+    @objc func moveWorkspaceUp(_ sender: NSMenuItem) { moveWorkspace(sender, by: -1) }
+    @objc func moveWorkspaceDown(_ sender: NSMenuItem) { moveWorkspace(sender, by: 1) }
+
+    func moveWorkspace(_ sender: NSMenuItem, by delta: Int) {
+        guard let ws = sender.representedObject as? Workspace,
+              let i = workspaces.firstIndex(where: { $0 === ws }),
+              workspaces.indices.contains(i + delta) else { return }
+        workspaces.swapAt(i, i + delta)
+        UserDefaults.standard.set(workspaces.map { $0.key }, forKey: "WorkspaceOrder")
+        layoutRail()
+        setupMainMenu()   // Cmd+1..9 follow the new order
+    }
+
+    // Custom logos live outside the app bundle so they survive rebuilds.
+    func customLogoURL(_ ws: Workspace) -> URL {
+        let dir = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+            .appendingPathComponent(Bundle.main.bundleIdentifier ?? "Chats")
+            .appendingPathComponent("logos")
+        // Percent-encoded, so distinct keys ("A/B", "A:B") stay distinct files.
+        let safe = ws.key.addingPercentEncoding(withAllowedCharacters: .alphanumerics) ?? ws.key
+        return dir.appendingPathComponent(safe + ".png")
+    }
+
+    @objc func changeLogo(_ sender: NSMenuItem) {
+        guard let ws = sender.representedObject as? Workspace else { return }
+        let panel = NSOpenPanel()
+        panel.message = "Choose a logo for \(ws.name) (square PNG works best)"
+        panel.allowedContentTypes = [.image]
+        panel.allowsMultipleSelection = false
+        panel.beginSheetModal(for: window) { [weak self] resp in
+            guard resp == .OK, let src = panel.url, let self = self else { return }
+            guard let img = NSImage(contentsOf: src), let tiff = img.tiffRepresentation,
+                  let png = NSBitmapImageRep(data: tiff)?.representation(using: .png, properties: [:]) else {
+                NSSound.beep()
+                return
+            }
+            let dest = self.customLogoURL(ws)
+            try? FileManager.default.createDirectory(at: dest.deletingLastPathComponent(),
+                                                     withIntermediateDirectories: true)
+            do {
+                try png.write(to: dest)
+            } catch {
+                NSAlert(error: error).runModal()
+                return
+            }
+            ws.button?.image = self.workspaceImage(ws)
+        }
+    }
+
+    @objc func resetLogo(_ sender: NSMenuItem) {
+        guard let ws = sender.representedObject as? Workspace else { return }
+        try? FileManager.default.removeItem(at: customLogoURL(ws))
+        ws.button?.image = workspaceImage(ws)
+    }
+
     // Rail badge: hidden, a small dot (unread, no count), or a red pill with
     // the count, pinned to the button's top-right corner.
     func updateRailBadge(_ ws: Workspace) {
@@ -832,8 +1008,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKUIDelegate, WKNaviga
     }
 
     func workspaceImage(_ ws: Workspace) -> NSImage? {
-        var logo: NSImage?
-        if let f = ws.iconFile {
+        var logo = NSImage(contentsOf: customLogoURL(ws))   // set via right-click > Change Logo
+        if logo == nil, let f = ws.iconFile {
             let base = (f as NSString).deletingPathExtension
             let ext = (f as NSString).pathExtension
             if let path = Bundle.main.path(forResource: base, ofType: ext) {
@@ -875,17 +1051,43 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKUIDelegate, WKNaviga
         for w in workspaces {
             w.webView.isHidden = (w !== ws)
             w.button?.layer?.backgroundColor = (w === ws)
-                ? NSColor(calibratedWhite: 1, alpha: 0.18).cgColor
+                ? accent(w).withAlphaComponent(0.7).cgColor
                 : NSColor.clear.cgColor
         }
+        accentBar?.layer?.backgroundColor = accent(ws).cgColor
         current = ws
+        UserDefaults.standard.set(ws.key, forKey: "LastWorkspaceKey")
         window.title = workspaces.count > 1
             ? "\((Bundle.main.object(forInfoDictionaryKey: "CFBundleName") as? String) ?? "Chat") -- \(ws.name)"
             : ws.name
         window.makeFirstResponder(ws.webView)
     }
 
-    // MARK: - Reload
+    // MARK: - Menu actions
+
+    @objc func selectWorkspaceFromMenu(_ sender: NSMenuItem) {
+        guard sender.tag < workspaces.count else { return }
+        window.makeKeyAndOrderFront(nil)
+        select(workspaces[sender.tag])
+    }
+
+    @objc func nextWorkspace(_ sender: Any?) { stepWorkspace(1) }
+    @objc func previousWorkspace(_ sender: Any?) { stepWorkspace(-1) }
+
+    func stepWorkspace(_ delta: Int) {
+        guard let cur = current, let i = workspaces.firstIndex(where: { $0 === cur }) else { return }
+        let n = workspaces.count
+        select(workspaces[((i + delta) % n + n) % n])
+    }
+
+    // In a popup window (image viewer, call), Cmd+R reloads that window.
+    @objc func reloadPage(_ sender: Any?) {
+        if let popup = NSApp.keyWindow as? PopupWindow, let wv = popup.contentView as? WKWebView {
+            wv.reload()
+        } else if let ws = current {
+            reload(ws)
+        }
+    }
 
     // A reload starts the unread probe from scratch; treat its first report as
     // the baseline again so a reload never raises a banner for old unread.
@@ -897,7 +1099,93 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKUIDelegate, WKNaviga
         ws.watcher?.reload()
     }
 
-    // MARK: - Window, launch at login, menu bar
+    // MARK: - Search, global shortcut, launch at login, menu bar
+
+    // Focus Chat's search box. It sits in the one [role=search] landmark; when
+    // collapsed, its visible button expands it, and the input only takes focus
+    // once Chat's animation has drawn it.
+    @objc func focusSearch(_ sender: Any?) {
+        // Chat's search is in the main window; bring it forward from a popup.
+        if NSApp.keyWindow is PopupWindow { window.makeKeyAndOrderFront(nil) }
+        guard let ws = current else { return }
+        ws.webView.callAsyncJavaScript(#"""
+            const visible = (e) => !!(e && (e.offsetWidth || e.offsetHeight || e.getClientRects().length));
+            const input = () => document.querySelector('input[name="q"]');
+            if (!visible(input())) {
+              const region = document.querySelector('[role="search"]');
+              const button = region && [...region.querySelectorAll('button')].find(visible);
+              if (button) button.click();
+            }
+            for (const until = Date.now() + 1500; Date.now() < until;) {
+              const q = input();
+              if (visible(q)) { q.focus(); q.select(); return true; }
+              await new Promise((r) => requestAnimationFrame(r));
+            }
+            return false;
+            """#, arguments: [:], in: nil, in: .page, completionHandler: nil)
+    }
+
+    // Cmd+N: Chat's own "New chat" button (the floating action button at the
+    // top of the sidebar, found by data-is-fab so it works in any UI language),
+    // which opens its people picker -- "Add 1 or more people", plus Create a
+    // space / Browse spaces / Find apps -- and focuses it.
+    @objc func newChat(_ sender: Any?) {
+        guard let ws = current else { return }
+        if !window.isVisible || !NSApp.isActive { showWindow() }
+        ws.webView.callAsyncJavaScript(#"""
+            const visible = (e) => !!(e && (e.offsetWidth || e.offsetHeight || e.getClientRects().length));
+            const button = [...document.querySelectorAll('button[data-is-fab="true"]')].find(visible)
+              || [...document.querySelectorAll('button')]
+                   .find((b) => visible(b) && /^New chat$/i.test((b.innerText || b.getAttribute('aria-label') || '').trim()));
+            if (!button) return false;
+            button.click();
+            for (const until = Date.now() + 1500; Date.now() < until;) {
+              const people = document.querySelector('input[aria-label="Add 1 or more people"]');
+              if (visible(people)) { people.focus(); return true; }
+              await new Promise((r) => requestAnimationFrame(r));
+            }
+            // The picker opened; Chat put the focus where it wanted. (No comment
+            // may end the script: callAsyncJavaScript wraps it in a function.)
+            return true;
+            """#, arguments: [:], in: nil, in: .page) { result in
+            if (try? result.get()) as? Bool != true { NSSound.beep() }
+        }
+    }
+
+    // Ctrl+Option+C from any app shows Chats, or hides it if it is in front.
+    // If another app already owns the combination, the menu says so (and it
+    // is logged) instead of advertising a shortcut that does nothing.
+    static let hotKeyID = EventHotKeyID(signature: OSType(0x4348_4154), id: 1)   // 'CHAT'
+
+    func registerGlobalHotKey() {
+        var spec = EventTypeSpec(eventClass: OSType(kEventClassKeyboard), eventKind: UInt32(kEventHotKeyPressed))
+        let installed = InstallEventHandler(GetApplicationEventTarget(), { _, event, _ in
+            var pressed = EventHotKeyID()
+            let status = GetEventParameter(event, EventParamName(kEventParamDirectObject), EventParamType(typeEventHotKeyID),
+                                           nil, MemoryLayout<EventHotKeyID>.size, nil, &pressed)
+            guard status == noErr, pressed.signature == AppDelegate.hotKeyID.signature,
+                  pressed.id == AppDelegate.hotKeyID.id else { return OSStatus(eventNotHandledErr) }
+            DispatchQueue.main.async { (NSApp.delegate as? AppDelegate)?.toggleVisibility() }
+            return noErr
+        }, 1, &spec, nil, nil)
+        let registered = installed == noErr
+            ? RegisterEventHotKey(UInt32(kVK_ANSI_C), UInt32(controlKey | optionKey), Self.hotKeyID,
+                                  GetApplicationEventTarget(), 0, &hotKeyRef)
+            : installed
+        hotKeyRegistered = registered == noErr
+        if !hotKeyRegistered {
+            chatLog.warning("Ctrl+Option+C could not be registered (status \(registered, privacy: .public)); in use by another app?")
+        }
+        setupMainMenu()   // the Chats menu shows whether it is available
+    }
+
+    func toggleVisibility() {
+        if NSApp.isActive && window.isVisible {
+            NSApp.hide(nil)
+        } else {
+            showWindow()
+        }
+    }
 
     func showWindow(_ ws: Workspace? = nil) {
         NSApp.activate(ignoringOtherApps: true)
@@ -952,6 +1240,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKUIDelegate, WKNaviga
             let item = menu.addItem(withTitle: title, action: #selector(openWorkspace(_:)), keyEquivalent: "")
             item.target = self
             item.representedObject = ws
+            item.image = NSImage(size: NSSize(width: 10, height: 10), flipped: false) { [weak self] r in
+                (self?.accent(ws) ?? .gray).setFill(); NSBezierPath(ovalIn: r).fill(); return true
+            }
         }
     }
 
@@ -1422,6 +1713,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKUIDelegate, WKNaviga
                  decisionHandler: @escaping (WKPermissionDecision) -> Void) {
         let host = origin.host.lowercased()
         decisionHandler(host == "google.com" || host.hasSuffix(".google.com") ? .grant : .prompt)
+    }
+
+    // Zoom applies to the current workspace and is remembered per workspace.
+    @objc func zoomIn(_ sender: Any?) { setZoom { $0 + 0.1 } }
+    @objc func zoomOut(_ sender: Any?) { setZoom { $0 - 0.1 } }
+    @objc func zoomReset(_ sender: Any?) { setZoom { _ in 1 } }
+
+    func setZoom(_ change: (CGFloat) -> CGFloat) {
+        guard let ws = current else { return }
+        let z = min(3, max(0.5, (change(ws.webView.pageZoom) * 10).rounded() / 10))
+        ws.webView.pageZoom = z
+        UserDefaults.standard.set(Double(z), forKey: "Zoom.\(ws.key)")
     }
 
     // MARK: - Navigation / popups

@@ -19,6 +19,13 @@ Xcode project, no dependencies.
   dot on the Dock icon (also shown in cmd+tab) if any workspace does. Google
   Chat exposes no reliable total count, so the app mirrors Chat's own favicon
   "dot" signal -- the same thing that dots a browser tab.
+- **Right-click a rail button** to move the workspace up or down, change or
+  reset its logo, pick its colour, or set its notifications. Order and custom
+  logos are remembered (logos live in
+  `~/Library/Application Support/<bundle-id>/logos/`, so they survive rebuilds).
+- **A colour per workspace.** A strip across the top of the window and the
+  selected rail button take the workspace's colour, so it is obvious which
+  account you are typing into.
 - **Mute and quiet hours per workspace** (right-click > Notifications): mute
   for an hour, until tomorrow or indefinitely, or turn on quiet hours (by
   default weekday evenings 18:00-08:00 plus weekends; the hours -- a same-day
@@ -40,8 +47,12 @@ Xcode project, no dependencies.
   (previews everywhere, more memory). Settings also has whether Reply sends
   immediately and, under Advanced, the Web Inspector (off by default).
 - **Launch at Login** under the Chats menu.
-- **Closing the window hides it** (Cmd+W): the app keeps running, so unread
-  counts and notifications stay live; click the Dock icon to bring it back.
+- **Keyboard shortcuts**: Cmd+1..9 switch workspace, Cmd+Shift+[ / ] step
+  through them, Cmd+N starts a new chat (Chat's people picker), Cmd+F
+  focuses Chat's search, Cmd+R reloads, Cmd+= / Cmd+- /
+  Cmd+0 zoom (saved per workspace), Cmd+W hides the window, and
+  **Ctrl+Option+C** shows or hides Chats from any app. The app reopens on the
+  last workspace.
 - **Stays connected.** After sleep or a network outage of more than a minute
   every workspace reloads, since the page can otherwise look connected while
   its real-time channel is dead; a crashed page reloads too.
@@ -122,9 +133,12 @@ APP_NAME="Work Chat" BUNDLE_ID=com.local.workchat ./build-combined.sh
 CONFIG=/path/to/other.conf ./build-combined.sh
 ```
 
-The app icon is composed from the workspace logos (one fills the card, two
-stack, three or more form a grid) and converted to `.icns` with `sips` +
-`iconutil`, both of which ship with macOS.
+The app icon is drawn by `draw-app-icon.swift` (two overlapping chat bubbles on
+a night-blue tile). `ICON_STYLE=logos ./build-combined.sh` composes it from the
+workspace logos instead (one fills the card, two stack, three or more form a
+grid) -- the default before this icon existed, so use it to keep the old look.
+Either way it is converted to `.icns` with `sips` + `iconutil`, both of which
+ship with macOS.
 
 ## Requirements
 
