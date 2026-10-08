@@ -93,6 +93,8 @@ cat > "${APPPATH}/Contents/Info.plist" <<EOF
 	<key>LSMinimumSystemVersion</key><string>14.0</string>
 	<key>NSHighResolutionCapable</key><true/>
 	<key>NSPrincipalClass</key><string>NSApplication</string>
+	<key>NSCameraUsageDescription</key><string>Google Chat huddles and calls use your camera.</string>
+	<key>NSMicrophoneUsageDescription</key><string>Google Chat huddles and calls use your microphone.</string>
 	<key>Workspaces</key>
 	<array>${entries}
 	</array>

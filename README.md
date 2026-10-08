@@ -19,12 +19,31 @@ Xcode project, no dependencies.
   dot on the Dock icon (also shown in cmd+tab) if any workspace does. Google
   Chat exposes no reliable total count, so the app mirrors Chat's own favicon
   "dot" signal -- the same thing that dots a browser tab.
-- **Right-click a rail button** to move the workspace up or down, or to change
-  or reset its logo. Order and custom logos are remembered (logos live in
+- **Right-click a rail button** to move the workspace up or down, change or
+  reset its logo, pick its colour, or set its notifications. Order and custom
+  logos are remembered (logos live in
   `~/Library/Application Support/<bundle-id>/logos/`, so they survive rebuilds).
+- **A colour per workspace.** A strip across the top of the window and the
+  selected rail button take the workspace's colour, so it is obvious which
+  account you are typing into.
+- **Mute and quiet hours per workspace** (right-click > Notifications): mute
+  for an hour, until tomorrow or indefinitely, or turn on quiet hours (weekday
+  evenings 18:00-08:00 and weekends; change with
+  `defaults write <bundle-id> QuietHoursStart -int 19` / `QuietHoursEnd`).
+  Muted workspaces still count unread, with a grey badge.
+- **Menu-bar icon** with the total unread and a menu to open each workspace;
+  the Dock icon's right-click menu lists them too. Toggle it under
+  Chats > Show in Menu Bar.
+- **Launch at Login** under the Chats menu.
 - **Keyboard shortcuts**: Cmd+1..9 switch workspace, Cmd+Shift+[ / ] step
-  through them, Cmd+R reloads, Cmd+= / Cmd+- / Cmd+0 zoom (saved per
-  workspace), Cmd+W hides the window. The app reopens on the last workspace.
+  through them, Cmd+F focuses Chat's search, Cmd+R reloads, Cmd+= / Cmd+- /
+  Cmd+0 zoom (saved per workspace), Cmd+W hides the window, and
+  **Ctrl+Option+C** shows or hides Chats from any app. The app reopens on the
+  last workspace.
+- **Stays connected.** After sleep or a network outage of more than a minute
+  every workspace reloads, since the page can otherwise look connected while
+  its real-time channel is dead; a crashed page reloads too.
+- **Huddles and calls** can use the camera and microphone (macOS asks once).
 - **Unread counts and notifications.** The rail and Dock show unread counts
   read from Chat's sidebar (a plain dot when Chat shows no number). Chat
   delivers its own alerts by Web Push, which an embedded WKWebView cannot
@@ -32,9 +51,13 @@ Xcode project, no dependencies.
   conversation's last-activity time moves and Chat marks it with a
   notification (DMs, @mentions -- Chat's own rules), it posts a macOS banner
   with the conversation name and, when Chat's Home list shows one, the message
-  preview, and bounces the Dock icon once. Clicking the banner opens that
-  conversation. This reads Chat's page markup, so it is best effort; if it
-  stops matching, banners fall back to a generic "New message".
+  preview, and bounces the Dock icon once. Every message gets its own banner.
+  Clicking one opens that conversation; **Reply** types into Chat's message box
+  and sends (bringing the app forward, and only once the right conversation is
+  open -- otherwise the reply goes to the clipboard), and **Mark as Read**
+  marks it read in the background. This reads Chat's page markup, so it is
+  best effort; if it stops matching, banners fall back to a generic
+  "New message".
 - **Attachments**: the upload button opens a file picker; downloads save to
   ~/Downloads.
 - **Image attachments open in their own window**, centered and scaled to fit on
