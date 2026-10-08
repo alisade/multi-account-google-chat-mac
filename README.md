@@ -136,8 +136,9 @@ CONFIG=/path/to/other.conf ./build-combined.sh
 The app icon is drawn by `draw-app-icon.swift` (two overlapping chat bubbles on
 a night-blue tile). `ICON_STYLE=logos ./build-combined.sh` composes it from the
 workspace logos instead (one fills the card, two stack, three or more form a
-grid). Either way it is converted to `.icns` with `sips` + `iconutil`, both of
-which ship with macOS.
+grid) -- the default before this icon existed, so use it to keep the old look.
+Either way it is converted to `.icns` with `sips` + `iconutil`, both of which
+ship with macOS.
 
 ## Requirements
 

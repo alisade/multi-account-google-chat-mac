@@ -64,6 +64,10 @@ done < "${WORK}/workspaces"
 
 # App icon: the app's own drawn icon (draw-app-icon.swift) by default, or with
 # ICON_STYLE=logos the workspace logos composited onto one card.
+case "${ICON_STYLE:-app}" in
+  app|logos) ;;
+  *) echo "warning: unknown ICON_STYLE '${ICON_STYLE}' (use app or logos); using app" >&2 ;;
+esac
 echo "drawing app icon ..."
 if [ "${ICON_STYLE:-app}" = "logos" ] && [ -n "${logos}" ]; then
   swiftc -O -framework Cocoa "${HERE}/compose-icon.swift" -o "${WORK}/compose-icon"

@@ -159,6 +159,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKUIDelegate, WKNaviga
     var accentBar: NSView?                 // strip across the top in the current workspace's colour
     var statusItem: NSStatusItem?          // menu-bar icon
     var hotKeyRef: EventHotKeyRef?         // global show/hide shortcut
+    var hotKeyRegistered = false
     var pathMonitor: NWPathMonitor?
     var offlineSince: Date?
     var asleepSince: Date?
@@ -264,7 +265,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKUIDelegate, WKNaviga
                                 ("Show in Menu Bar", #selector(toggleMenuBarIcon(_:)))] {
             appMenu.addItem(withTitle: title, action: action, keyEquivalent: "").target = self
         }
-        let hotKeyInfo = appMenu.addItem(withTitle: "Show/Hide from Anywhere: \u{2303}\u{2325}C", action: nil, keyEquivalent: "")
+        let hotKeyInfo = appMenu.addItem(
+            withTitle: hotKeyRegistered ? "Show/Hide from Anywhere: \u{2303}\u{2325}C"
+                                        : "Show/Hide from Anywhere: \u{2303}\u{2325}C is in use by another app",
+            action: nil, keyEquivalent: "")
         hotKeyInfo.isEnabled = false
         appMenu.addItem(NSMenuItem.separator())
         appMenu.addItem(withTitle: "Send Test Notification",
@@ -387,8 +391,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKUIDelegate, WKNaviga
             container.addSubview(wv)
             wv.load(URLRequest(url: ws.url))
         }
-        let last = UserDefaults.standard.string(forKey: "LastWorkspace")
-        if let ws = workspaces.first(where: { $0.name == last }) ?? workspaces.first { select(ws) }
+        // Keyed like order, colour and logo (ws.key), so renaming a workspace
+        // with a pinned store UUID keeps it; older builds saved the name.
+        let last = UserDefaults.standard.string(forKey: "LastWorkspaceKey")
+        let lastName = UserDefaults.standard.string(forKey: "LastWorkspace")
+        if let ws = workspaces.first(where: { $0.key == last }) ?? workspaces.first(where: { $0.name == lastName })
+            ?? workspaces.first { select(ws) }
 
         // Accent strip across the top of the page, in the current workspace's
         // colour, so it is obvious which account you are typing into.
@@ -675,7 +683,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKUIDelegate, WKNaviga
         wv.allowsBackForwardNavigationGestures = true
         // Settings > Advanced: Safari > Develop > Chats lists each page.
         wv.isInspectable = UserDefaults.standard.bool(forKey: "WebInspector")
-        let zoom = UserDefaults.standard.double(forKey: "Zoom.\(ws.name)")
+        let d = UserDefaults.standard
+        let zoom = d.object(forKey: "Zoom.\(ws.key)") as? Double ?? d.double(forKey: "Zoom.\(ws.name)")
         if zoom > 0 { wv.pageZoom = zoom }
         return wv
     }
@@ -936,8 +945,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKUIDelegate, WKNaviga
         let dir = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
             .appendingPathComponent(Bundle.main.bundleIdentifier ?? "Chats")
             .appendingPathComponent("logos")
-        let safe = ws.key.map { $0.isLetter || $0.isNumber || $0 == "-" ? $0 : "_" }
-        return dir.appendingPathComponent(String(safe) + ".png")
+        // Percent-encoded, so distinct keys ("A/B", "A:B") stay distinct files.
+        let safe = ws.key.addingPercentEncoding(withAllowedCharacters: .alphanumerics) ?? ws.key
+        return dir.appendingPathComponent(safe + ".png")
     }
 
     @objc func changeLogo(_ sender: NSMenuItem) {
@@ -1046,7 +1056,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKUIDelegate, WKNaviga
         }
         accentBar?.layer?.backgroundColor = accent(ws).cgColor
         current = ws
-        UserDefaults.standard.set(ws.name, forKey: "LastWorkspace")
+        UserDefaults.standard.set(ws.key, forKey: "LastWorkspaceKey")
         window.title = workspaces.count > 1
             ? "\((Bundle.main.object(forInfoDictionaryKey: "CFBundleName") as? String) ?? "Chat") -- \(ws.name)"
             : ws.name
@@ -1070,7 +1080,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKUIDelegate, WKNaviga
         select(workspaces[((i + delta) % n + n) % n])
     }
 
-    @objc func reloadPage(_ sender: Any?) { if let ws = current { reload(ws) } }
+    // In a popup window (image viewer, call), Cmd+R reloads that window.
+    @objc func reloadPage(_ sender: Any?) {
+        if let popup = NSApp.keyWindow as? PopupWindow, let wv = popup.contentView as? WKWebView {
+            wv.reload()
+        } else if let ws = current {
+            reload(ws)
+        }
+    }
 
     // A reload starts the unread probe from scratch; treat its first report as
     // the baseline again so a reload never raises a banner for old unread.
@@ -1088,6 +1105,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKUIDelegate, WKNaviga
     // collapsed, its visible button expands it, and the input only takes focus
     // once Chat's animation has drawn it.
     @objc func focusSearch(_ sender: Any?) {
+        // Chat's search is in the main window; bring it forward from a popup.
+        if NSApp.keyWindow is PopupWindow { window.makeKeyAndOrderFront(nil) }
         guard let ws = current else { return }
         ws.webView.callAsyncJavaScript(#"""
             const visible = (e) => !!(e && (e.offsetWidth || e.offsetHeight || e.getClientRects().length));
@@ -1107,15 +1126,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKUIDelegate, WKNaviga
     }
 
     // Cmd+N: Chat's own "New chat" button (the floating action button at the
-    // top of the sidebar), which opens its people picker -- "Add 1 or more
-    // people", plus Create a space / Browse spaces / Find apps -- and focuses it.
+    // top of the sidebar, found by data-is-fab so it works in any UI language),
+    // which opens its people picker -- "Add 1 or more people", plus Create a
+    // space / Browse spaces / Find apps -- and focuses it.
     @objc func newChat(_ sender: Any?) {
         guard let ws = current else { return }
         if !window.isVisible || !NSApp.isActive { showWindow() }
         ws.webView.callAsyncJavaScript(#"""
             const visible = (e) => !!(e && (e.offsetWidth || e.offsetHeight || e.getClientRects().length));
-            const button = [...document.querySelectorAll('button[data-is-fab="true"], button')]
-              .find((b) => visible(b) && /^New chat$/i.test((b.innerText || b.getAttribute('aria-label') || '').trim()));
+            const button = [...document.querySelectorAll('button[data-is-fab="true"]')].find(visible)
+              || [...document.querySelectorAll('button')]
+                   .find((b) => visible(b) && /^New chat$/i.test((b.innerText || b.getAttribute('aria-label') || '').trim()));
             if (!button) return false;
             button.click();
             for (const until = Date.now() + 1500; Date.now() < until;) {
@@ -1132,15 +1153,30 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKUIDelegate, WKNaviga
     }
 
     // Ctrl+Option+C from any app shows Chats, or hides it if it is in front.
+    // If another app already owns the combination, the menu says so (and it
+    // is logged) instead of advertising a shortcut that does nothing.
+    static let hotKeyID = EventHotKeyID(signature: OSType(0x4348_4154), id: 1)   // 'CHAT'
+
     func registerGlobalHotKey() {
         var spec = EventTypeSpec(eventClass: OSType(kEventClassKeyboard), eventKind: UInt32(kEventHotKeyPressed))
-        InstallEventHandler(GetApplicationEventTarget(), { _, _, _ in
+        let installed = InstallEventHandler(GetApplicationEventTarget(), { _, event, _ in
+            var pressed = EventHotKeyID()
+            let status = GetEventParameter(event, EventParamName(kEventParamDirectObject), EventParamType(typeEventHotKeyID),
+                                           nil, MemoryLayout<EventHotKeyID>.size, nil, &pressed)
+            guard status == noErr, pressed.signature == AppDelegate.hotKeyID.signature,
+                  pressed.id == AppDelegate.hotKeyID.id else { return OSStatus(eventNotHandledErr) }
             DispatchQueue.main.async { (NSApp.delegate as? AppDelegate)?.toggleVisibility() }
             return noErr
         }, 1, &spec, nil, nil)
-        let id = EventHotKeyID(signature: OSType(0x4348_4154), id: 1)   // 'CHAT'
-        RegisterEventHotKey(UInt32(kVK_ANSI_C), UInt32(controlKey | optionKey), id,
-                            GetApplicationEventTarget(), 0, &hotKeyRef)
+        let registered = installed == noErr
+            ? RegisterEventHotKey(UInt32(kVK_ANSI_C), UInt32(controlKey | optionKey), Self.hotKeyID,
+                                  GetApplicationEventTarget(), 0, &hotKeyRef)
+            : installed
+        hotKeyRegistered = registered == noErr
+        if !hotKeyRegistered {
+            chatLog.warning("Ctrl+Option+C could not be registered (status \(registered, privacy: .public)); in use by another app?")
+        }
+        setupMainMenu()   // the Chats menu shows whether it is available
     }
 
     func toggleVisibility() {
@@ -1688,7 +1724,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKUIDelegate, WKNaviga
         guard let ws = current else { return }
         let z = min(3, max(0.5, (change(ws.webView.pageZoom) * 10).rounded() / 10))
         ws.webView.pageZoom = z
-        UserDefaults.standard.set(Double(z), forKey: "Zoom.\(ws.name)")
+        UserDefaults.standard.set(Double(z), forKey: "Zoom.\(ws.key)")
     }
 
     // MARK: - Navigation / popups
