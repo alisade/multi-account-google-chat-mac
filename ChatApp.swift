@@ -44,7 +44,7 @@ final class Workspace {
     var unreadCount = 0               // Chat's "Home" unread count; 0 if not shown
     var unreadReported = false        // first badge report seen (startup state)
     var lastPageNotification: Date?   // last banner raised by the page itself
-    var lastBanner: [String: (text: String, at: Date)] = [:]   // per conversation, for de-duplication
+    var lastBanner: [String: (text: String, count: Int, at: Date)] = [:]   // per conversation, for de-duplication
     var markupMissing: Set<String> = []   // selectors already logged as not matching
     var crashes: [Date] = []          // recent web-process crashes, for reload backoff
 
@@ -137,6 +137,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKUIDelegate, WKNaviga
     var reloadWhenOnline = false           // woke while offline: reload once the network is back
     var warmUps: [String: CompanionWarmUp] = [:]   // in-flight companion warm-ups, by workspace key + host
     var panelRecoveries: [String: [Date]] = [:]     // recent panel recoveries, by workspace key + host
+    var panelRetryPending: Set<String> = []         // panel bounced while its warm-up was already running
+    var lastFullReload: Date?                       // wake/reconnect reloads, to avoid doing it twice
+    var afterLoad: [ObjectIdentifier: () -> Void] = [:]   // run when that navigation finishes (Reply)
 
     // MARK: - Workspace config
 
@@ -313,14 +316,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKUIDelegate, WKNaviga
         let center = UNUserNotificationCenter.current()
         center.delegate = self
         center.requestAuthorization(options: [.alert, .sound]) { _, _ in }
-        // Reply and Mark as Read on message banners. Reply brings the app forward:
-        // Chat only opens a conversation while its page is on screen.
-        center.setNotificationCategories([UNNotificationCategory(
-            identifier: "MESSAGE",
-            actions: [UNTextInputNotificationAction(identifier: "REPLY", title: "Reply", options: [.foreground],
-                                                    textInputButtonTitle: "Send", textInputPlaceholder: "Reply"),
-                      UNNotificationAction(identifier: "MARK_READ", title: "Mark as Read", options: [])],
-            intentIdentifiers: [], options: [])])
+        registerNotificationCategories()
 
         NSApp.setActivationPolicy(.regular)
         NSApp.activate(ignoringOtherApps: true)
@@ -357,6 +353,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKUIDelegate, WKNaviga
         (function(){
           var last = null;
           var seen = {};                 // conversation id -> last timestamp seen
+          var seenAlerts = {};           // conversation id -> last "N Notifications" seen
           var startedAt = Date.now();
           var SKIP = /^(Active|Away|Busy|Do not disturb|Out of office|Offline|Unread|Pinned conversation|Space|Conversation|Meeting conversation|Group conversation|External|Muted|Now|Yesterday|Open in a pop-up|Options|Summarize|Close|Mark as read|Press tab.*|\d+|\d+ Notifications?|\d+ (min|mins|hr|hrs)|\d{1,2}:\d{2}( [AP]M)?)$/i;
 
@@ -377,6 +374,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKUIDelegate, WKNaviga
             for (var i = 0; i < rows.length; i++) {
               var r = rows[i], id = r.getAttribute('data-group-id');
               var ts = parseInt(r.getAttribute('data-display-timestamp'), 10) || 0;
+              // Milliseconds since the epoch (observed: 1791433185952, Oct 2026);
+              // tolerate microseconds should that ever change.
+              if (ts > 1e14) ts = Math.floor(ts / 1000);
               var it = r.innerText || '';
               var nm = /(\d+)\s+Notifications?/.exec(it);
               var c = map[id] || (map[id] = { id: id, ts: 0, alerts: 0, name: '', text: '' });
@@ -402,15 +402,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKUIDelegate, WKNaviga
             var m = home && /(\d+)\s+unread/i.exec(home.getAttribute('aria-label'));
             if (m) count = parseInt(m[1], 10);
 
-            // A conversation is new news if its timestamp moved past what we
-            // last saw (or, first time we see it, past when the page loaded --
-            // rows also appear when the list scrolls or finishes loading).
+            // New news is a rise in a conversation's notification count -- not
+            // any timestamp bump, which edits, reactions and your own messages
+            // from another device also cause. A row seen for the first time (the
+            // list scrolled or finished loading) is new only if its last
+            // activity is after the page loaded.
             var messages = [], convs = conversations();
             for (var id in convs) {
               var c = convs[id], prev = seen[id];
-              var fresh = prev === undefined ? c.ts > startedAt : c.ts > prev;
-              if (fresh && c.alerts > 0) messages.push({ id: c.id, name: c.name, text: c.text });
+              var rose = prev === undefined ? (c.ts > startedAt && c.alerts > 0)
+                                            : c.alerts > (seenAlerts[id] || 0);
+              if (rose) messages.push({ id: c.id, name: c.name, text: c.text, count: c.alerts });
               seen[id] = Math.max(prev || 0, c.ts);
+              seenAlerts[id] = c.alerts;
             }
 
             var key = unread + ':' + count;
@@ -710,9 +714,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKUIDelegate, WKNaviga
                     if self.offlineSince == nil { self.offlineSince = Date() }
                 } else if let since = self.offlineSince {
                     self.offlineSince = nil
-                    if Date().timeIntervalSince(since) > 60 || self.reloadWhenOnline {
+                    // Also redo a reload that ran during this outage: it loaded
+                    // nothing.
+                    let reloadedOffline = (self.lastFullReload ?? .distantPast) >= since
+                    if Date().timeIntervalSince(since) > 60 || self.reloadWhenOnline || reloadedOffline {
                         self.reloadWhenOnline = false
-                        self.reloadAllWhenOnline()
+                        self.reloadAllWhenOnline(force: reloadedOffline)
                     }
                 }
             }
@@ -721,11 +728,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKUIDelegate, WKNaviga
         pathMonitor = monitor
     }
 
-    // Wait out the first seconds after wake, when Wi-Fi is still joining.
-    func reloadAllWhenOnline() {
+    // Wait out the first seconds after wake, when Wi-Fi is still joining. Wake
+    // and reconnect often both fire: one reload a minute is enough, unless
+    // `force` (the previous one ran while offline).
+    func reloadAllWhenOnline(force: Bool = false) {
         DispatchQueue.main.asyncAfter(deadline: .now() + 5) { [weak self] in
             guard let self = self else { return }
             if self.offlineSince != nil { self.reloadWhenOnline = true; return }
+            if !force, let last = self.lastFullReload, Date().timeIntervalSince(last) < 60 { return }
+            self.lastFullReload = Date()
             self.workspaces.forEach(self.reload)
         }
     }
@@ -764,7 +775,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKUIDelegate, WKNaviga
     // so it recovers without the user pressing "Try again".
     func warmUpCompanion(_ ws: Workspace, host: String, retryPanel: Bool = false) {
         let key = "\(ws.key)|\(host)"
-        guard warmUps[key] == nil, let url = URL(string: "https://\(host)/") else { return }
+        // Already warming up (e.g. the startup one): reload the panel when done.
+        if warmUps[key] != nil {
+            if retryPanel { panelRetryPending.insert(key) }
+            return
+        }
+        guard let url = URL(string: "https://\(host)/") else { return }
         // A panel that keeps bouncing to sign-in would otherwise cycle forever
         // (reload -> bounce -> warm-up): at most 2 recoveries per 10 minutes.
         if retryPanel {
@@ -779,7 +795,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKUIDelegate, WKNaviga
                                        userAgent: ws.webView.customUserAgent) { [weak self] ok in
             DispatchQueue.main.async {
                 self?.warmUps[key] = nil
-                guard ok, retryPanel else { return }
+                let pending = self?.panelRetryPending.remove(key) != nil
+                guard ok, retryPanel || pending else { return }
                 ws.webView.callAsyncJavaScript(#"""
                     for (const f of document.querySelectorAll('iframe')) {
                       try { if (new URL(f.src).host === host) f.src = f.src; } catch (e) {}
@@ -978,7 +995,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKUIDelegate, WKNaviga
     // MARK: - Downloads
 
     // Save to ~/Downloads under the server's filename, adding " (1)", " (2)", ...
-    // instead of overwriting an existing file.
+    // instead of overwriting an existing file -- or one another download in
+    // flight is already writing to.
     func download(_ download: WKDownload, decideDestinationUsing response: URLResponse,
                   suggestedFilename: String, completionHandler: @escaping (URL?) -> Void) {
         let dir = FileManager.default.urls(for: .downloadsDirectory, in: .userDomainMask)[0]
@@ -987,7 +1005,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKUIDelegate, WKNaviga
         let ext = (name as NSString).pathExtension
         var dest = dir.appendingPathComponent(name)
         var n = 1
-        while FileManager.default.fileExists(atPath: dest.path) {
+        while FileManager.default.fileExists(atPath: dest.path) || downloads.values.contains(dest) {
             dest = dir.appendingPathComponent(ext.isEmpty ? "\(base) (\(n))" : "\(base) (\(n)).\(ext)")
             n += 1
         }
@@ -1118,6 +1136,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKUIDelegate, WKNaviga
 
     // MARK: - Desktop notifications
 
+    // Reply and Mark as Read on message banners. Reply brings the app forward
+    // (Chat only opens a conversation while its page is on screen) and types
+    // the reply for you to send, so its button says "Type Reply", not "Send".
+    func registerNotificationCategories() {
+        UNUserNotificationCenter.current().setNotificationCategories([UNNotificationCategory(
+            identifier: "MESSAGE",
+            actions: [UNTextInputNotificationAction(identifier: "REPLY", title: "Reply", options: [.foreground],
+                                                    textInputButtonTitle: "Type Reply",
+                                                    textInputPlaceholder: "Reply"),
+                      UNNotificationAction(identifier: "MARK_READ", title: "Mark as Read", options: [])],
+            intentIdentifiers: [], options: [])])
+    }
+
     // Runs `new Notification(...)` in the current workspace's page, exercising
     // the whole shim -> native -> Notification Center path without needing an
     // incoming Chat message. The banner shows after a short delay so you can
@@ -1202,11 +1233,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKUIDelegate, WKNaviga
         guard let conv = m["id"] as? String, !conv.isEmpty else { return }
         let name = (m["name"] as? String) ?? ""
         let text = (m["text"] as? String) ?? ""
-        // Chat bumps a row's timestamp several times for one message (seen: 4
-        // bumps in 10 s). Skip a repeat of the same conversation + text within
-        // 15 s; a different message always gets its own banner.
-        if let last = ws.lastBanner[conv], last.text == text, Date().timeIntervalSince(last.at) < 15 { return }
-        ws.lastBanner[conv] = (text, Date())
+        let count = (m["count"] as? Int) ?? 0
+        // The same report twice (e.g. the sidebar and Home rows of one
+        // conversation) within 15 s is one banner; a different text or count
+        // -- a new message, even without a preview -- is another.
+        if let last = ws.lastBanner[conv], last.text == text, last.count == count,
+           Date().timeIntervalSince(last.at) < 15 { return }
+        ws.lastBanner[conv] = (text, count, Date())
         ws.lastPageNotification = Date()   // suppresses the generic banner
         let content = UNMutableNotificationContent()
         content.title = name.isEmpty ? ws.name : name
@@ -1214,7 +1247,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKUIDelegate, WKNaviga
         content.body = text.isEmpty ? "New message" : text
         content.sound = .default
         content.threadIdentifier = ws.name
-        content.userInfo = ["workspace": ws.key, "conversation": conv]
+        content.userInfo = ["workspace": ws.key, "conversation": conv, "name": name]
         content.categoryIdentifier = "MESSAGE"   // Reply / Mark as Read
         postBanner(content, group: "\(ws.key)|conv|\(conv)")
         bounceDock()
@@ -1278,7 +1311,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKUIDelegate, WKNaviga
             case "REPLY":
                 guard let ws = ws, !conv.isEmpty, let text = replyText, !text.isEmpty else { return }
                 self.showWindow(ws)
-                self.sendReply(ws, conv, text)
+                self.sendReply(ws, conv, (info["name"] as? String) ?? "", text)
                 return
             default: break
             }
@@ -1299,18 +1332,36 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKUIDelegate, WKNaviga
     // Open a conversation by clicking its row (sidebar or Home list) in the page.
     // If the page has no row for it, load the conversation's URL instead:
     // /app/chat/<id>, where the id is the part after "dm/" or "space/".
-    func openConversation(_ ws: Workspace, _ conv: String, then: (() -> Void)? = nil) {
+    // `then` runs once the switch has started: right after the row click
+    // (`clicked` true), or -- for a URL load, which replaces the page and any
+    // script running in it -- only once that navigation has finished.
+    func openConversation(_ ws: Workspace, _ conv: String, then: ((_ clicked: Bool) -> Void)? = nil) {
         ws.webView.callAsyncJavaScript(#"""
             const sel = '[role=listitem][data-group-id="' + CSS.escape(conv) + '"]';
             const row = document.querySelector(sel + ' [role=link]') || document.querySelector(sel);
             if (row) row.click();
             return !!row;
             """#, arguments: ["conv": conv], in: nil, in: .page) { [weak self] result in
-            if (try? result.get()) as? Bool != true, let url = self?.conversationURL(ws, conv) {
-                ws.webView.load(URLRequest(url: url))
+            guard let self = self else { return }
+            if (try? result.get()) as? Bool == true { then?(true); return }
+            guard let url = self.conversationURL(ws, conv), let nav = ws.webView.load(URLRequest(url: url)) else {
+                then?(false)
+                return
             }
-            then?()
+            if let then = then { self.afterLoad[ObjectIdentifier(nav)] = { then(false) } }
         }
+    }
+
+    func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
+        afterLoad.removeValue(forKey: ObjectIdentifier(navigation))?()
+    }
+
+    func webView(_ webView: WKWebView, didFail navigation: WKNavigation!, withError error: Error) {
+        afterLoad.removeValue(forKey: ObjectIdentifier(navigation))?()
+    }
+
+    func webView(_ webView: WKWebView, didFailProvisionalNavigation navigation: WKNavigation!, withError error: Error) {
+        afterLoad.removeValue(forKey: ObjectIdentifier(navigation))?()
     }
 
     func conversationURL(_ ws: Workspace, _ conv: String) -> URL? {
@@ -1325,28 +1376,37 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKUIDelegate, WKNaviga
     // any doubt it stops, and the reply goes to the clipboard instead, so
     // nothing lands in the wrong place or is lost.
 
-    func sendReply(_ ws: Workspace, _ conv: String, _ text: String) {
+    func sendReply(_ ws: Workspace, _ conv: String, _ name: String, _ text: String) {
         let path = ws.webView.url?.path ?? ""
         if path.hasSuffix("/" + (conv.split(separator: "/").last.map(String.init) ?? "-")) {
-            typeReply(ws, conv, text)
+            typeReply(ws, conv, name, text, afterClick: false)
         } else {
-            openConversation(ws, conv) { [weak self] in self?.typeReply(ws, conv, text) }
+            openConversation(ws, conv) { [weak self] clicked in
+                self?.typeReply(ws, conv, name, text, afterClick: clicked)
+            }
         }
     }
 
-    // Types the reply into Chat's message box, only once the page's URL ends
-    // in the conversation's id.
-    func typeReply(_ ws: Workspace, _ conv: String, _ text: String) {
+    // Types the reply into the conversation's message box. Chat updates the URL
+    // before it renders the new conversation, so the URL alone is not enough:
+    // the box must be labelled "Message <conversation name>", or -- when the
+    // name is unknown or worded differently -- be a "Message ..." box that was
+    // not already there before the row click (the previous conversation's).
+    func typeReply(_ ws: Workspace, _ conv: String, _ name: String, _ text: String, afterClick: Bool) {
         ws.webView.callAsyncJavaScript(#"""
             const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
             const visible = (e) => !!(e && (e.offsetWidth || e.offsetHeight || e.getClientRects().length));
             const want = '/' + conv.split('/').pop();
+            const editors = () => [...document.querySelectorAll('[role=textbox][contenteditable=true]')];
+            const stale = new Set(afterClick ? editors() : []);
+            const label = (b) => b.getAttribute('aria-label') || '';
             let box = null;
-            // Up to 20 s: opening by URL is a full page load.
+            // Up to 20 s for Chat to render the conversation.
             for (const until = Date.now() + 20000; Date.now() < until; await sleep(150)) {
               if (!location.pathname.endsWith(want)) continue;
-              const boxes = [...document.querySelectorAll('[role=textbox][contenteditable=true]')].filter(visible);
-              box = boxes.find((b) => /^Message /.test(b.getAttribute('aria-label') || '')) || boxes[0];
+              const boxes = editors().filter(visible).filter((b) => /^Message /.test(label(b)));
+              box = boxes.find((b) => name && label(b) === 'Message ' + name)
+                 || boxes.find((b) => !stale.has(b));
               if (box) break;
             }
             if (!box) return 'message box not found';
@@ -1359,7 +1419,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKUIDelegate, WKNaviga
             }
             if (!box.innerText.trim()) return 'could not type into the message box';
             return 'typed';
-            """#, arguments: ["conv": conv, "text": text], in: nil, in: .page) { [weak self] result in
+            """#, arguments: ["conv": conv, "text": text, "name": name, "afterClick": afterClick],
+               in: nil, in: .page) { [weak self] result in
             let outcome = (try? result.get()) as? String
             guard outcome != "typed" else { return }
             chatLog.warning("Reply failed: \(outcome ?? "no result", privacy: .public)")
@@ -1375,7 +1436,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKUIDelegate, WKNaviga
 
     // Mark as Read from a banner, without bringing the app forward: Chat's
     // Home list has a "Mark as read" button on each unread row. If the row is
-    // not on the Home list, open the conversation instead (which reads it).
+    // not on the Home list, open the conversation instead (which reads it),
+    // still in the background.
     func markRead(_ ws: Workspace, _ conv: String) {
         ws.webView.callAsyncJavaScript(#"""
             const sel = '[role=listitem][data-group-id="' + CSS.escape(conv) + '"]';
@@ -1385,7 +1447,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKUIDelegate, WKNaviga
             """#, arguments: ["conv": conv], in: nil, in: .page) { [weak self] result in
             if (try? result.get()) as? Bool == true { return }
             chatLog.info("Mark as Read: no Home-list button; opening the conversation instead")
-            self?.showWindow(ws)
             self?.openConversation(ws, conv)
         }
     }
