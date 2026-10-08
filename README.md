@@ -37,7 +37,8 @@ Xcode project, no dependencies.
   opens it. The Dock icon's right-click menu lists the same, one line each. Toggle
   the icon under Chats > Show in Menu Bar.
 - **Settings** (Chats > Settings..., Cmd+,): appearance, menu-bar inbox, launch
-  at login, quiet-hours times, and how to get **message previews**. Previews
+  at login, quiet hours (on/off per workspace, and the times), and how to get
+  **message previews**. Previews
   come from Chat's Home list, which is only on the page while a workspace shows
   Home (the sidebar has names and counts, not text), so choose: only while on
   Home (default); send background workspaces back to Home after N minutes; or

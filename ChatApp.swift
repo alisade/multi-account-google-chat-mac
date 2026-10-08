@@ -842,6 +842,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKUIDelegate, WKNaviga
         let key = "QuietHours.\(ws.key)"
         UserDefaults.standard.set(!UserDefaults.standard.bool(forKey: key), forKey: key)
         updateBadges()
+        refreshSettings()
     }
 
     // Quiet hours: weekends, and weekdays before `end` or from `start` on.
@@ -1352,6 +1353,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKUIDelegate, WKNaviga
             NSTextField(labelWithString: "to"),
             popup("quietEnd", hours, #selector(settingsQuietChanged(_:))),
         ])
+        // One on/off box per workspace; all off disables quiet hours.
+        let quietOn = NSStackView(views: workspaces.map { ws -> NSView in
+            let b = NSButton(checkboxWithTitle: ws.name, target: self, action: #selector(settingsQuietWorkspaceChanged(_:)))
+            settingsControls["quiet.\(ws.key)"] = b
+            return b
+        })
+        quietOn.spacing = 16
         let empty = NSGridCell.emptyContentView
         let grid = NSGridView(views: [
             [label("Appearance:"), popup("appearance", ["System", "Light", "Dark"], #selector(settingsAppearanceChanged(_:)))],
@@ -1364,8 +1372,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKUIDelegate, WKNaviga
             [empty, help],
             [label("Back to Home after:"), popup("minutes", [1, 2, 5, 10, 15, 30].map { "\($0) minutes" },
                                                  tags: [1, 2, 5, 10, 15, 30], #selector(settingsPreviewChanged(_:)))],
-            [label("Quiet hours:"), quiet],
-            [empty, note("Weekdays in this range, and all weekend. Turn quiet hours on per workspace: right-click its button \u{203A} Notifications.")],
+            [label("Quiet hours for:"), quietOn],
+            [label("From:"), quiet],
+            [empty, note("No banners during these weekday hours and all weekend, for the workspaces ticked above. Untick all to turn quiet hours off. Also under right-click \u{203A} Notifications on each workspace.")],
         ])
         grid.column(at: 0).xPlacement = .trailing
         grid.rowAlignment = .firstBaseline
@@ -1403,6 +1412,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKUIDelegate, WKNaviga
         settingsControls["minutes"]?.isEnabled = previewMode == 1
         (settingsControls["quietStart"] as? NSPopUpButton)?.selectItem(withTag: quietHours.start)
         (settingsControls["quietEnd"] as? NSPopUpButton)?.selectItem(withTag: quietHours.end)
+        let anyQuiet = workspaces.contains { d.bool(forKey: "QuietHours.\($0.key)") }
+        for ws in workspaces {
+            (settingsControls["quiet.\(ws.key)"] as? NSButton)?.state = d.bool(forKey: "QuietHours.\(ws.key)") ? .on : .off
+        }
+        settingsControls["quietStart"]?.isEnabled = anyQuiet
+        settingsControls["quietEnd"]?.isEnabled = anyQuiet
         previewHelp?.stringValue = Self.previewHelpText[min(previewMode, 2)]
         if let win = settingsWindow, let content = win.contentView {
             win.setContentSize(content.fittingSize)
@@ -1420,6 +1435,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKUIDelegate, WKNaviga
         if let m = settingsControls["minutes"] as? NSPopUpButton { d.set(m.selectedTag(), forKey: "ReturnHomeMinutes") }
         applyPreviewMode()
         refreshSettings()
+    }
+
+    @objc func settingsQuietWorkspaceChanged(_ sender: NSButton) {
+        guard let ws = workspaces.first(where: { settingsControls["quiet.\($0.key)"] === sender }) else { return }
+        UserDefaults.standard.set(sender.state == .on, forKey: "QuietHours.\(ws.key)")
+        refreshSettings()
+        updateBadges()
     }
 
     @objc func settingsQuietChanged(_ sender: NSPopUpButton) {
