@@ -1192,6 +1192,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKUIDelegate, WKNaviga
             [label("Appearance:"), popup("appearance", ["System", "Light", "Dark"], #selector(settingsAppearanceChanged(_:)))],
             [empty, check("menuBar", "Show unread inbox in the menu bar", #selector(toggleMenuBarIcon(_:)))],
             [empty, check("login", "Launch Chats at login", #selector(toggleLaunchAtLogin(_:)))],
+            [label("Notifications:"), check("banners", "Show a banner for new messages",
+                                            #selector(settingsBannersChanged(_:)))],
+            [empty, check("bannerSound", "Play a sound with banners", #selector(settingsBannersChanged(_:)))],
+            [empty, note("Chat's own notification chime is separate: if you hear two sounds, turn one off here or in Chat's settings (gear icon).")],
             [label("Message previews:"), popup("preview", ["Only while a workspace is on Home",
                                                            "Send background workspaces back to Home",
                                                            "Keep a hidden Home view per workspace"],
@@ -1214,7 +1218,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKUIDelegate, WKNaviga
         grid.rowAlignment = .firstBaseline
         grid.rowSpacing = 10
         grid.columnSpacing = 8
-        for key in ["preview", "replySends", "quiet.\(workspaces.first?.key ?? "")", "inspector"] {
+        for key in ["banners", "preview", "replySends", "quiet.\(workspaces.first?.key ?? "")", "inspector"] {
             if let v = settingsControls[key] { grid.cell(for: v)?.row?.topPadding = 14 }
         }
         grid.translatesAutoresizingMaskIntoConstraints = false
@@ -1256,6 +1260,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKUIDelegate, WKNaviga
         settingsControls["quietWeekends"]?.isEnabled = anyQuiet
         (settingsControls["quietWeekends"] as? NSButton)?.state = quietWeekends ? .on : .off
         (settingsControls["replySends"] as? NSButton)?.state = replySendsImmediately ? .on : .off
+        (settingsControls["banners"] as? NSButton)?.state = bannersEnabled ? .on : .off
+        (settingsControls["bannerSound"] as? NSButton)?.state = bannerSound ? .on : .off
+        settingsControls["bannerSound"]?.isEnabled = bannersEnabled
         (settingsControls["inspector"] as? NSButton)?.state = d.bool(forKey: "WebInspector") ? .on : .off
         previewHelp?.stringValue = Self.previewHelpText[min(previewMode, 2)]
         if let win = settingsWindow, let content = win.contentView {
@@ -1279,6 +1286,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKUIDelegate, WKNaviga
     @objc func settingsQuietWeekendsChanged(_ sender: NSButton) {
         UserDefaults.standard.set(sender.state == .on, forKey: "QuietHoursWeekends")
         updateBadges()
+    }
+
+    @objc func settingsBannersChanged(_ sender: NSButton) {
+        let d = UserDefaults.standard
+        if let b = settingsControls["banners"] as? NSButton { d.set(b.state == .on, forKey: "BannersEnabled") }
+        if let b = settingsControls["bannerSound"] as? NSButton { d.set(b.state == .on, forKey: "BannerSound") }
+        refreshSettings()
     }
 
     @objc func settingsReplyChanged(_ sender: NSButton) {
@@ -1743,7 +1757,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKUIDelegate, WKNaviga
             }
             return
         }
-        guard type == "show", !isMuted(ws) else { return }
+        guard type == "show", bannersEnabled, !isMuted(ws) else { return }
 
         notifFrames[id] = message.frameInfo
         ws.lastPageNotification = Date()
@@ -1755,7 +1769,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKUIDelegate, WKNaviga
         content.title = (body["title"] as? String) ?? ""
         content.body = (body["body"] as? String) ?? ""
         if workspaces.count > 1 { content.subtitle = ws.name }
-        content.sound = .default
+        content.sound = bannerSound ? .default : nil
         content.threadIdentifier = ws.name
         content.userInfo = ["workspace": ws.key, "pageID": id]
         let tag = (body["tag"] as? String) ?? ""
@@ -1767,8 +1781,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKUIDelegate, WKNaviga
     // One Dock bounce for a new message while the app is in the background
     // (the same as Slack's default; .criticalRequest would bounce until opened).
     func bounceDock() {
-        if !NSApp.isActive { NSApp.requestUserAttention(.informationalRequest) }
+        if bannersEnabled && !NSApp.isActive { NSApp.requestUserAttention(.informationalRequest) }
     }
+
+    // Settings > Notifications. Off: no banners, sounds or Dock bounces (unread
+    // counts, badges and the inbox still update). The sound can be turned off
+    // on its own -- e.g. when Chat's own in-page chime is left on.
+    var bannersEnabled: Bool { UserDefaults.standard.object(forKey: "BannersEnabled") as? Bool ?? true }
+    var bannerSound: Bool { UserDefaults.standard.object(forKey: "BannerSound") as? Bool ?? true }
 
     func workspace(forKey key: Any?) -> Workspace? {
         guard let key = key as? String else { return nil }
@@ -1781,6 +1801,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKUIDelegate, WKNaviga
     // an id still in Notification Center would only update it in place -- no
     // banner, no sound.
     func postBanner(_ content: UNNotificationContent, group: String) {
+        guard bannersEnabled else { return }
         UNUserNotificationCenter.current().add(
             UNNotificationRequest(identifier: group + "#" + UUID().uuidString, content: content, trigger: nil))
     }
@@ -1806,7 +1827,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKUIDelegate, WKNaviga
         content.title = name.isEmpty ? ws.name : name
         if workspaces.count > 1 && !name.isEmpty { content.subtitle = ws.name }
         content.body = text.isEmpty ? "New message" : text
-        content.sound = .default
+        content.sound = bannerSound ? .default : nil
         content.threadIdentifier = ws.name
         content.userInfo = ["workspace": ws.key, "conversation": conv, "name": name]
         content.categoryIdentifier = "MESSAGE"   // Reply / Mark as Read
@@ -1836,7 +1857,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKUIDelegate, WKNaviga
         content.body = ws.unreadCount > 1
             ? "\(ws.unreadCount) unread messages in Google Chat"
             : "New message in Google Chat"
-        content.sound = .default
+        content.sound = bannerSound ? .default : nil
         content.threadIdentifier = ws.name
         content.userInfo = ["workspace": ws.key]
         postBanner(content, group: "\(ws.key)|unread")
