@@ -44,6 +44,15 @@ Xcode project, no dependencies.
   every workspace reloads, since the page can otherwise look connected while
   its real-time channel is dead; a crashed page reloads too.
 - **Huddles and calls** can use the camera and microphone (macOS asks once).
+- **Calendar in Chat's side panel works.** In a fresh, isolated workspace,
+  Calendar has no sign-in of its own, and its sign-in redirect inside Chat's
+  side panel is blocked by Chat's content security policy, so the panel shows
+  "Couldn't load". The app opens Calendar once, hidden, in each workspace so
+  it signs itself in, and redoes that (then reloads the panel) if the panel is
+  ever sent to sign-in again.
+- **App appearance** (View > Appearance): System, Light or Dark for the app's
+  window, title bar and rail. Chat's pages keep following the system
+  appearance -- Chat has its own theme setting.
 - **Unread counts and notifications.** The rail and Dock show unread counts
   read from Chat's sidebar (a plain dot when Chat shows no number). Chat
   delivers its own alerts by Web Push, which an embedded WKWebView cannot

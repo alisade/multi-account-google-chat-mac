@@ -76,6 +76,44 @@ let safariVersion: String = {
 }()
 let safariUA = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/\(safariVersion) Safari/605.1.15"
 
+// Loads a Google service's own page once, top-level, in a hidden web view that
+// shares a workspace's data store, then discards itself. See warmUpCompanions.
+final class CompanionWarmUp: NSObject, WKNavigationDelegate {
+    let webView: WKWebView
+    let done: (Bool) -> Void   // true when the service's own page loaded
+    private var finished = false
+
+    init(url: URL, store: WKWebsiteDataStore, userAgent: String?, done: @escaping (Bool) -> Void) {
+        let cfg = WKWebViewConfiguration()
+        cfg.websiteDataStore = store
+        webView = WKWebView(frame: NSRect(x: 0, y: 0, width: 800, height: 600), configuration: cfg)
+        webView.customUserAgent = userAgent
+        self.done = done
+        super.init()
+        webView.navigationDelegate = self
+        webView.load(URLRequest(url: url))
+        // Sign-in redirects normally settle in a few seconds; never hang on.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 45) { [weak self] in self?.finish("timeout") }
+    }
+
+    // Done once the page has landed back on the service itself.
+    func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
+        if webView.url?.host?.hasSuffix("accounts.google.com") == false { finish("ok") }
+    }
+
+    func webView(_ webView: WKWebView, didFail navigation: WKNavigation!, withError error: Error) { finish("fail") }
+    func webView(_ webView: WKWebView, didFailProvisionalNavigation navigation: WKNavigation!, withError error: Error) {
+        finish("fail")
+    }
+
+    private func finish(_ outcome: String) {
+        guard !finished else { return }
+        finished = true
+        webView.stopLoading()
+        done(outcome == "ok")
+    }
+}
+
 final class AppDelegate: NSObject, NSApplicationDelegate, WKUIDelegate, WKNavigationDelegate, WKScriptMessageHandler, WKDownloadDelegate, UNUserNotificationCenterDelegate, NSWindowDelegate, NSMenuItemValidation, NSMenuDelegate {
     var window: NSWindow!
     var container: NSView!
@@ -93,6 +131,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKUIDelegate, WKNaviga
     var offlineSince: Date?
     var asleepSince: Date?
     var reloadWhenOnline = false           // woke while offline: reload once the network is back
+    var railView: NSView?
+    var warmUps: [String: CompanionWarmUp] = [:]   // in-flight companion warm-ups, by workspace key + host
 
     // MARK: - Workspace config
 
@@ -227,6 +267,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKUIDelegate, WKNaviga
         add(viewMenu, "Actual Size", #selector(zoomReset(_:)), "0")
         add(viewMenu, "Zoom In", #selector(zoomIn(_:)), "=")
         add(viewMenu, "Zoom Out", #selector(zoomOut(_:)), "-")
+        viewMenu.addItem(NSMenuItem.separator())
+        let appearanceMenu = NSMenu()
+        for (i, title) in ["System", "Light", "Dark"].enumerated() {
+            add(appearanceMenu, title, #selector(setAppAppearance(_:)), "", tag: i)
+        }
+        viewMenu.addItem(withTitle: "Appearance", action: nil, keyEquivalent: "").submenu = appearanceMenu
 
         // Cmd+1..9 jump to a workspace, as in Slack and browser tabs.
         if workspaces.count > 1 {
@@ -315,7 +361,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKUIDelegate, WKNaviga
 
         if UserDefaults.standard.object(forKey: "ShowMenuBarIcon") as? Bool ?? true { installStatusItem() }
         registerGlobalHotKey()
+        applyAppearance()
+        DistributedNotificationCenter.default().addObserver(
+            forName: Notification.Name("AppleInterfaceThemeChangedNotification"), object: nil, queue: .main
+        ) { [weak self] _ in
+            // The new style is readable a moment after the notification.
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) { self?.applyAppearance() }
+        }
         watchSleepAndNetwork()
+        // Give Chat's side-panel companions their own sign-in up front.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 8) { [weak self] in
+            self?.workspaces.forEach { self?.warmUpCompanion($0, host: "calendar.google.com") }
+        }
         // Refresh mute/quiet-hours state on the rail, menu bar and Dock.
         Timer.scheduledTimer(withTimeInterval: 60, repeats: true) { [weak self] _ in self?.updateBadges() }
 
@@ -546,8 +603,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKUIDelegate, WKNaviga
         let rail = NSView(frame: NSRect(x: 0, y: 0, width: width, height: height))
         rail.autoresizingMask = [.height]
         rail.wantsLayer = true
-        rail.layer?.backgroundColor = NSColor(calibratedWhite: 0.12, alpha: 1).cgColor
         root.addSubview(rail)
+        railView = rail
 
         let flip = FlippedView(frame: rail.bounds)
         flip.autoresizingMask = [.width, .height]
@@ -576,7 +633,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKUIDelegate, WKNaviga
             dot.wantsLayer = true
             dot.layer?.backgroundColor = NSColor.systemRed.cgColor
             dot.layer?.borderWidth = 2
-            dot.layer?.borderColor = NSColor(calibratedWhite: 0.12, alpha: 1).cgColor
             dot.isHidden = true
             let label = NSTextField(labelWithString: "")
             label.font = NSFont.systemFont(ofSize: 10, weight: .bold)
@@ -651,6 +707,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKUIDelegate, WKNaviga
         case #selector(toggleMenuBarIcon(_:)):
             item.state = statusItem != nil ? .on : .off
             return true
+        case #selector(setAppAppearance(_:)):
+            item.state = UserDefaults.standard.integer(forKey: "AppAppearance") == item.tag ? .on : .off
+            return true
         default: break
         }
         guard let ws = item.representedObject as? Workspace,
@@ -673,6 +732,31 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKUIDelegate, WKNaviga
             return true
         default: return true
         }
+    }
+
+    // MARK: - Appearance
+
+    // View > Appearance: System / Light / Dark for the app itself -- window,
+    // title bar, rail, menus. Chat has its own theme setting, so its pages keep
+    // following the system appearance whatever is chosen here.
+    @objc func setAppAppearance(_ sender: NSMenuItem) {
+        UserDefaults.standard.set(sender.tag, forKey: "AppAppearance")
+        applyAppearance()
+    }
+
+    var systemIsDark: Bool { UserDefaults.standard.string(forKey: "AppleInterfaceStyle") == "Dark" }
+
+    func applyAppearance() {
+        let choice = UserDefaults.standard.integer(forKey: "AppAppearance")   // 0 system, 1 light, 2 dark
+        NSApp.appearance = choice == 1 ? NSAppearance(named: .aqua)
+            : choice == 2 ? NSAppearance(named: .darkAqua) : nil
+        let dark = choice == 2 || (choice == 0 && systemIsDark)
+        let system = NSAppearance(named: systemIsDark ? .darkAqua : .aqua)
+        for ws in workspaces { ws.webView.appearance = system }
+        for win in popupWindows { win.contentView?.appearance = system }
+        let rail = NSColor(calibratedWhite: dark ? 0.12 : 0.88, alpha: 1).cgColor
+        railView?.layer?.backgroundColor = rail
+        for ws in workspaces { ws.dot?.layer?.borderColor = rail }
     }
 
     // MARK: - Accent colours
@@ -1071,6 +1155,48 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKUIDelegate, WKNaviga
         if let ws = workspaces.first(where: { $0.webView === webView }) { reload(ws) }
     }
 
+    // MARK: - Side-panel companions (Calendar)
+
+    // Chat's side panel embeds Calendar from calendar.google.com. Calendar keeps
+    // its own per-service sign-in cookie; with none in a workspace's fresh,
+    // isolated store, the embedded page bounces through
+    // accounts.google.com/ServiceLogin, whose return trip to calendar.google.com
+    // inside Chat's iframe is blocked by Chat's CSP (frame-src) -- and the panel
+    // shows "Couldn't load". A browser never hits this because Calendar was
+    // opened directly at some point. So open Calendar once, top-level and
+    // hidden, in the same store: it signs itself in there, outside Chat's CSP,
+    // and the panel then loads directly. Redone whenever the panel is seen
+    // bouncing to sign-in again (cookie expired).
+    // `retryPanel`: the panel already failed; once signed in, reload its iframe
+    // so it recovers without the user pressing "Try again".
+    func warmUpCompanion(_ ws: Workspace, host: String, retryPanel: Bool = false) {
+        let key = "\(ws.key)|\(host)"
+        guard warmUps[key] == nil, let url = URL(string: "https://\(host)/") else { return }
+        warmUps[key] = CompanionWarmUp(url: url, store: ws.webView.configuration.websiteDataStore,
+                                       userAgent: ws.webView.customUserAgent) { [weak self] ok in
+            DispatchQueue.main.async {
+                self?.warmUps[key] = nil
+                guard ok, retryPanel else { return }
+                ws.webView.callAsyncJavaScript(#"""
+                    for (const f of document.querySelectorAll('iframe')) {
+                      try { if (new URL(f.src).host === host) f.src = f.src; } catch (e) {}
+                    }
+                    """#, arguments: ["host": host], in: nil, in: .page, completionHandler: nil)
+            }
+        }
+    }
+
+    // The panel's iframe being sent to sign-in for a service, e.g.
+    // accounts.google.com/ServiceLogin?service=cl&continue=https://calendar.google.com/...
+    func companionNeedingSignIn(_ url: URL) -> String? {
+        guard url.host == "accounts.google.com", url.path.hasPrefix("/ServiceLogin"),
+              let cont = URLComponents(url: url, resolvingAgainstBaseURL: false)?
+                .queryItems?.first(where: { $0.name == "continue" })?.value,
+              let host = URL(string: cont)?.host, host.hasSuffix(".google.com"), host != "chat.google.com"
+        else { return nil }
+        return host
+    }
+
     // MARK: - Camera and microphone
 
     // Huddles and calls inside Chat ask for the camera/mic. Grant Google's own
@@ -1107,6 +1233,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKUIDelegate, WKNaviga
             return
         }
         let isMainFrame = navigationAction.targetFrame?.isMainFrame ?? true
+        if !isMainFrame, let url = navigationAction.request.url, let host = companionNeedingSignIn(url),
+           let ws = workspaces.first(where: { $0.webView === webView }) {
+            warmUpCompanion(ws, host: host, retryPanel: true)
+        }
         if navigationAction.navigationType == .linkActivated, isMainFrame,
            let url = navigationAction.request.url, isExternal(url) {
             openExternally(url)
@@ -1195,6 +1325,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKUIDelegate, WKNaviga
                               backing: .buffered, defer: false)
         win.title = window.title
         win.contentView = popup
+        popup.appearance = NSAppearance(named: systemIsDark ? .darkAqua : .aqua)
         win.isReleasedWhenClosed = false
         win.delegate = self
         win.center()
