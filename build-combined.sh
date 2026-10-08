@@ -11,6 +11,7 @@
 #   OUT_DIR=/Applications ./build-combined.sh
 #   APP_NAME="Work Chat" BUNDLE_ID=com.local.workchat ./build-combined.sh
 #   CONFIG=/path/to/other.conf ./build-combined.sh
+#   ICON_STYLE=logos ./build-combined.sh             # app icon from workspace logos
 
 set -eu
 
@@ -61,16 +62,19 @@ while IFS='|' read -r name url icon store; do
 		</dict>"
 done < "${WORK}/workspaces"
 
-# App icon: composite the logos onto one card, then make an .icns.
-ICON_KEY=""
-if [ -n "${logos}" ]; then
-  echo "composing combined icon ..."
+# App icon: the app's own drawn icon (draw-app-icon.swift) by default, or with
+# ICON_STYLE=logos the workspace logos composited onto one card.
+echo "drawing app icon ..."
+if [ "${ICON_STYLE:-app}" = "logos" ] && [ -n "${logos}" ]; then
   swiftc -O -framework Cocoa "${HERE}/compose-icon.swift" -o "${WORK}/compose-icon"
   # shellcheck disable=SC2086  # logos is a space-separated list of plain names
-  (cd "${APPPATH}/Contents/Resources" && "${WORK}/compose-icon" "${WORK}/combined.png" ${logos})
-  sh "${HERE}/make-icns.sh" "${WORK}/combined.png" "${APPPATH}/Contents/Resources/app.icns"
-  ICON_KEY='<key>CFBundleIconFile</key><string>app.icns</string>'
+  (cd "${APPPATH}/Contents/Resources" && "${WORK}/compose-icon" "${WORK}/icon.png" ${logos})
+else
+  swiftc -O -framework Cocoa "${HERE}/draw-app-icon.swift" -o "${WORK}/draw-app-icon"
+  "${WORK}/draw-app-icon" "${WORK}/icon.png"
 fi
+sh "${HERE}/make-icns.sh" "${WORK}/icon.png" "${APPPATH}/Contents/Resources/app.icns"
+ICON_KEY='<key>CFBundleIconFile</key><string>app.icns</string>'
 
 cat > "${APPPATH}/Contents/Info.plist" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>

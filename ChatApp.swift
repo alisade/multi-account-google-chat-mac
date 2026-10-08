@@ -1,4 +1,6 @@
 import Cocoa
+import UniformTypeIdentifiers
+import UserNotifications
 import WebKit
 
 // A minimal Slack-style multi-workspace WebKit app. Info.plist's "Workspaces"
@@ -36,7 +38,15 @@ final class Workspace {
     var webView: WKWebView!
     var button: NSButton?
     var dot: NSView?
+    var dotLabel: NSTextField?
     var unread = false
+    var unreadCount = 0               // Chat's "Home" unread count; 0 if not shown
+    var unreadReported = false        // first badge report seen (startup state)
+    var lastPageNotification: Date?   // last banner raised by the page itself
+
+    // Stable per-workspace key (survives reordering; the store UUID also
+    // survives renaming when pinned in workspaces.conf).
+    var key: String { storeID?.uuidString ?? name }
 
     init(name: String, url: URL) {
         self.name = name
@@ -61,13 +71,16 @@ let safariVersion: String = {
 }()
 let safariUA = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/\(safariVersion) Safari/605.1.15"
 
-final class AppDelegate: NSObject, NSApplicationDelegate, WKUIDelegate, WKNavigationDelegate, WKScriptMessageHandler, NSWindowDelegate {
+final class AppDelegate: NSObject, NSApplicationDelegate, WKUIDelegate, WKNavigationDelegate, WKScriptMessageHandler, WKDownloadDelegate, UNUserNotificationCenterDelegate, NSWindowDelegate, NSMenuItemValidation {
     var window: NSWindow!
     var container: NSView!
     var workspaces: [Workspace] = []
     var current: Workspace?
     var appHosts: Set<String> = ["chat.google.com"]
     var popupWindows = Set<PopupWindow>()
+    var railContent: FlippedView?
+    var downloads: [WKDownload: URL] = [:]   // in-flight download -> destination
+    var notifFrames: [String: WKFrameInfo] = [:]   // page notification id -> frame that raised it
 
     // MARK: - Workspace config
 
@@ -88,6 +101,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKUIDelegate, WKNaviga
         let s = (Bundle.main.object(forInfoDictionaryKey: "AppStartURL") as? String) ?? "https://chat.google.com/"
         let name = (Bundle.main.object(forInfoDictionaryKey: "CFBundleName") as? String) ?? "Chat"
         return [Workspace(name: name, url: URL(string: s)!)]
+    }
+
+    // The rail order the user picked (right-click > Move Up/Down), by workspace
+    // key. Workspaces not in the saved list (e.g. newly added to the config)
+    // keep their config order after the saved ones.
+    func applySavedOrder(_ list: [Workspace]) -> [Workspace] {
+        let saved = UserDefaults.standard.stringArray(forKey: "WorkspaceOrder") ?? []
+        let rank = Dictionary(saved.enumerated().map { ($1, $0) }, uniquingKeysWith: { a, _ in a })
+        return list.enumerated().sorted { a, b in
+            (rank[a.element.key] ?? saved.count + a.offset) < (rank[b.element.key] ?? saved.count + b.offset)
+        }.map { $0.element }
     }
 
     // A link is "external" (open in the default browser) unless it belongs to a
@@ -144,6 +168,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKUIDelegate, WKNaviga
         appMenu.addItem(withTitle: "Show All",
                         action: #selector(NSApplication.unhideAllApplications(_:)), keyEquivalent: "")
         appMenu.addItem(NSMenuItem.separator())
+        appMenu.addItem(withTitle: "Send Test Notification",
+                        action: #selector(sendTestNotification(_:)), keyEquivalent: "")
+        appMenu.addItem(NSMenuItem.separator())
         appMenu.addItem(withTitle: "Quit \(appName)",
                         action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
 
@@ -160,14 +187,55 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKUIDelegate, WKNaviga
         editMenu.addItem(withTitle: "Paste", action: #selector(NSText.paste(_:)), keyEquivalent: "v")
         editMenu.addItem(withTitle: "Select All", action: #selector(NSText.selectAll(_:)), keyEquivalent: "a")
 
+        let viewItem = NSMenuItem()
+        mainMenu.addItem(viewItem)
+        let viewMenu = NSMenu(title: "View")
+        viewItem.submenu = viewMenu
+        func add(_ menu: NSMenu, _ title: String, _ action: Selector, _ key: String,
+                 _ mods: NSEvent.ModifierFlags = .command, tag: Int = 0) {
+            let item = menu.addItem(withTitle: title, action: action, keyEquivalent: key)
+            item.keyEquivalentModifierMask = mods
+            item.target = self
+            item.tag = tag
+        }
+        add(viewMenu, "Reload", #selector(reloadPage(_:)), "r")
+        viewMenu.addItem(NSMenuItem.separator())
+        add(viewMenu, "Actual Size", #selector(zoomReset(_:)), "0")
+        add(viewMenu, "Zoom In", #selector(zoomIn(_:)), "=")
+        add(viewMenu, "Zoom Out", #selector(zoomOut(_:)), "-")
+
+        // Cmd+1..9 jump to a workspace, as in Slack and browser tabs.
+        if workspaces.count > 1 {
+            let wsItem = NSMenuItem()
+            mainMenu.addItem(wsItem)
+            let wsMenu = NSMenu(title: "Workspace")
+            wsItem.submenu = wsMenu
+            for (i, ws) in workspaces.enumerated() {
+                add(wsMenu, ws.name, #selector(selectWorkspaceFromMenu(_:)), i < 9 ? "\(i + 1)" : "", tag: i)
+            }
+            wsMenu.addItem(NSMenuItem.separator())
+            add(wsMenu, "Next Workspace", #selector(nextWorkspace(_:)), "]", [.command, .shift])
+            add(wsMenu, "Previous Workspace", #selector(previousWorkspace(_:)), "[", [.command, .shift])
+        }
+
+        let windowItem = NSMenuItem()
+        mainMenu.addItem(windowItem)
+        let windowMenu = NSMenu(title: "Window")
+        windowItem.submenu = windowMenu
+        windowMenu.addItem(withTitle: "Minimize",
+                           action: #selector(NSWindow.performMiniaturize(_:)), keyEquivalent: "m")
+        windowMenu.addItem(withTitle: "Close",
+                           action: #selector(NSWindow.performClose(_:)), keyEquivalent: "w")
+
         NSApp.mainMenu = mainMenu
+        NSApp.windowsMenu = windowMenu
     }
 
     // MARK: - Launch
 
     func applicationDidFinishLaunching(_ note: Notification) {
+        workspaces = applySavedOrder(loadWorkspaces())
         setupMainMenu()
-        workspaces = loadWorkspaces()
         appHosts = Set(workspaces.map { $0.host }.filter { !$0.isEmpty })
         if appHosts.isEmpty { appHosts = ["chat.google.com"] }
 
@@ -178,6 +246,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKUIDelegate, WKNaviga
                           backing: .buffered, defer: false)
         window.title = name
         window.setFrameAutosaveName("MainWindow")
+        window.delegate = self
         let root = NSView(frame: frame)
         window.contentView = root
         // Lay out from root.bounds, not the literal `frame`: setFrameAutosaveName
@@ -204,7 +273,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKUIDelegate, WKNaviga
             container.addSubview(wv)
             wv.load(URLRequest(url: ws.url))
         }
-        if let first = workspaces.first { select(first) }
+        let last = UserDefaults.standard.string(forKey: "LastWorkspace")
+        if let ws = workspaces.first(where: { $0.name == last }) ?? workspaces.first { select(ws) }
 
         window.center()
         window.makeKeyAndOrderFront(nil)
@@ -221,6 +291,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKUIDelegate, WKNaviga
             return event
         }
 
+        let center = UNUserNotificationCenter.current()
+        center.delegate = self
+        center.requestAuthorization(options: [.alert, .sound]) { _, _ in }
+
         NSApp.setActivationPolicy(.regular)
         NSApp.activate(ignoringOtherApps: true)
     }
@@ -236,36 +310,174 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKUIDelegate, WKNaviga
         }
         cfg.defaultWebpagePreferences.allowsContentJavaScript = true
 
-        // Google Chat does not put an unread count in the page title, but it does
-        // swap its favicon between a "no dot" and a "dot" variant to signal unread
-        // (the same signal that dots a browser tab). Watch the favicon href and
-        // report has-unread to the native side, which drives the rail dot + Dock
-        // badge (also shown in the Cmd+Tab switcher).
-        let unreadProbe = """
+        // Unread state and new-message detection, read from Chat's own page.
+        //  - Has-unread: Chat swaps its favicon between "..._favicon_no_dot_..."
+        //    and "..._favicon_dot_..." (what dots a browser tab).
+        //  - Count: the sidebar's "Home shortcut, N unread message(s)" label.
+        //  - New messages: every conversation row ([role=listitem][data-group-id],
+        //    in the sidebar and the Home list) carries data-display-timestamp, its
+        //    last activity. A row whose timestamp moves forward while it shows
+        //    "N Notification(s)" -- Chat's own rule for what deserves an alert
+        //    (DMs, @mentions, followed threads) -- is a new message. Its name is
+        //    the row's first meaningful text; the Home list row also has a
+        //    preview of the message ([jsname=ok3btb]).
+        // Chat's real alerts arrive by Web Push, which WKWebView cannot receive
+        // (see notifyShim), so this is how the app knows about new messages.
+        // All of it depends on Chat's markup and English UI text, so it is best
+        // effort: if a selector stops matching, that piece goes quiet (no name,
+        // no preview, or no count) and the favicon dot still works.
+        let unreadProbe = #"""
         (function(){
           var last = null;
+          var seen = {};                 // conversation id -> last timestamp seen
+          var startedAt = Date.now();
+          var SKIP = /^(Active|Away|Busy|Do not disturb|Out of office|Offline|Unread|Pinned conversation|Space|Conversation|Meeting conversation|Group conversation|External|Muted|Now|Yesterday|Open in a pop-up|Options|Summarize|Close|Mark as read|Press tab.*|\d+|\d+ Notifications?|\d+ (min|mins|hr|hrs)|\d{1,2}:\d{2}( [AP]M)?)$/i;
+
+          function nameOf(row) {
+            var w = document.createTreeWalker(row, NodeFilter.SHOW_TEXT);
+            for (var n = w.nextNode(); n; n = w.nextNode()) {
+              var t = n.nodeValue.trim(), el = n.parentElement;
+              if (!t || SKIP.test(t)) continue;
+              if (el.closest('button, i, [role=tooltip], [jsname=ok3btb]')) continue;
+              return t;
+            }
+            return '';
+          }
+
+          function conversations() {
+            var map = {};
+            var rows = document.querySelectorAll('[role=listitem][data-group-id][data-display-timestamp]');
+            for (var i = 0; i < rows.length; i++) {
+              var r = rows[i], id = r.getAttribute('data-group-id');
+              var ts = parseInt(r.getAttribute('data-display-timestamp'), 10) || 0;
+              var nm = /(\d+)\s+Notifications?/.exec(r.innerText || '');
+              var c = map[id] || (map[id] = { id: id, ts: 0, alerts: 0, name: '', text: '' });
+              c.ts = Math.max(c.ts, ts);
+              if (nm) c.alerts = Math.max(c.alerts, parseInt(nm[1], 10));
+              var preview = r.querySelector('[jsname=ok3btb]');
+              if (preview && !c.text) c.text = (preview.innerText || '').trim().slice(0, 300);
+              if (!c.name) c.name = nameOf(r);
+            }
+            return map;
+          }
+
           function check(){
             var links = document.querySelectorAll('link[rel~="icon"]');
             var unread = false;
             for (var i = 0; i < links.length; i++) {
               var h = links[i].href;
-              // Unread favicon is "..._favicon_dot_...", read is
-              // "..._favicon_no_dot_..." -- exclude the "no_dot" form (it also
-              // contains the substring "_dot_").
+              // Exclude "no_dot": it also contains the substring "_dot_".
               if (/_dot_/.test(h) && !/no_dot/.test(h)) { unread = true; break; }
             }
-            if (unread !== last) {
-              last = unread;
-              window.webkit.messageHandlers.badge.postMessage(unread);
+            var count = 0;
+            var home = document.querySelector('[aria-label^="Home shortcut"]');
+            var m = home && /(\d+)\s+unread/i.exec(home.getAttribute('aria-label'));
+            if (m) count = parseInt(m[1], 10);
+
+            // A conversation is new news if its timestamp moved past what we
+            // last saw (or, first time we see it, past when the page loaded --
+            // rows also appear when the list scrolls or finishes loading).
+            var messages = [], convs = conversations();
+            for (var id in convs) {
+              var c = convs[id], prev = seen[id];
+              var fresh = prev === undefined ? c.ts > startedAt : c.ts > prev;
+              if (fresh && c.alerts > 0) messages.push({ id: c.id, name: c.name, text: c.text });
+              seen[id] = Math.max(prev || 0, c.ts);
+            }
+
+            var key = unread + ':' + count;
+            if (key !== last || messages.length) {
+              last = key;
+              window.webkit.messageHandlers.badge.postMessage({ unread: unread, count: count, messages: messages });
             }
           }
           setInterval(check, 2000);
           check();
         })();
-        """
+        """#
         cfg.userContentController.addUserScript(
             WKUserScript(source: unreadProbe, injectionTime: .atDocumentEnd, forMainFrameOnly: true))
         cfg.userContentController.add(self, name: "badge")
+
+        // WKWebView gives pages no working Notification API. Install a stand-in
+        // at document start that reports permission "granted" and forwards any
+        // page-level notification to Notification Center; a banner click calls
+        // back into the page (__chatNotifClick). Chat itself delivers message
+        // alerts via Web Push to its service worker, which WKWebView does not
+        // support, so in practice new-message banners come from the unread
+        // signal instead (see notifyUnread); this covers anything Chat does show
+        // from the page. All frames: Chat runs parts of its UI in iframes.
+        let notifyShim = """
+        (function(){
+          if (window.__chatNotifShim) return;
+          window.__chatNotifShim = true;
+          var mh = window.webkit && window.webkit.messageHandlers && window.webkit.messageHandlers.notify;
+          if (!mh) return;
+          var seq = 0, live = {}, order = [];
+          function Shim(title, opts) {
+            opts = opts || {};
+            this.title = String(title == null ? '' : title);
+            this.body = opts.body == null ? '' : String(opts.body);
+            this.tag = opts.tag == null ? '' : String(opts.tag);
+            this.data = opts.data;
+            this.icon = opts.icon;
+            this.onclick = this.onclose = this.onshow = this.onerror = null;
+            this._l = {};
+            this._id = Date.now() + '-' + (++seq);
+            live[this._id] = this;
+            order.push(this._id);
+            if (order.length > 200) delete live[order.shift()];
+            mh.postMessage({ type: 'show', id: this._id, title: this.title, body: this.body, tag: this.tag });
+            var self = this;
+            setTimeout(function(){ self._fire('show'); }, 0);
+          }
+          Shim.prototype.addEventListener = function(t, f){ (this._l[t] = this._l[t] || []).push(f); };
+          Shim.prototype.removeEventListener = function(t, f){
+            var a = this._l[t]; if (a) { var i = a.indexOf(f); if (i >= 0) a.splice(i, 1); }
+          };
+          Shim.prototype._fire = function(t){
+            var ev = { type: t, target: this, currentTarget: this, preventDefault: function(){} };
+            var h = this['on' + t];
+            if (typeof h === 'function') { try { h.call(this, ev); } catch (e) {} }
+            (this._l[t] || []).slice().forEach(function(f){ try { f.call(this, ev); } catch (e) {} }, this);
+          };
+          Shim.prototype.close = function(){
+            if (!live[this._id]) return;
+            delete live[this._id];
+            mh.postMessage({ type: 'close', id: this._id });
+            this._fire('close');
+          };
+          Shim.permission = 'granted';
+          Shim.maxActions = 0;
+          Shim.requestPermission = function(cb){
+            if (typeof cb === 'function') cb('granted');
+            return Promise.resolve('granted');
+          };
+          window.__chatNotifClick = function(id){
+            var n = live[id];
+            if (n) { try { window.focus(); } catch (e) {} n._fire('click'); }
+          };
+          Object.defineProperty(window, 'Notification', { value: Shim, writable: true, configurable: true });
+          if (window.ServiceWorkerRegistration) {
+            ServiceWorkerRegistration.prototype.showNotification = function(title, opts){
+              new Shim(title, opts); return Promise.resolve();
+            };
+          }
+          if (navigator.permissions && navigator.permissions.query) {
+            var q = navigator.permissions.query.bind(navigator.permissions);
+            navigator.permissions.query = function(d){
+              if (d && d.name === 'notifications') {
+                return Promise.resolve({ state: 'granted', status: 'granted', onchange: null,
+                  addEventListener: function(){}, removeEventListener: function(){} });
+              }
+              return q(d);
+            };
+          }
+        })();
+        """
+        cfg.userContentController.addUserScript(
+            WKUserScript(source: notifyShim, injectionTime: .atDocumentStart, forMainFrameOnly: false))
+        cfg.userContentController.add(self, name: "notify")
 
         let wv = WKWebView(frame: .zero, configuration: cfg)
         // Present as Safari so Google's login does not flag an "insecure browser".
@@ -273,6 +485,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKUIDelegate, WKNaviga
         wv.uiDelegate = self
         wv.navigationDelegate = self
         wv.allowsBackForwardNavigationGestures = true
+        // Safari > Develop > Chats lists each workspace page for debugging.
+        if #available(macOS 13.3, *) { wv.isInspectable = true }
+        let zoom = UserDefaults.standard.double(forKey: "Zoom.\(ws.name)")
+        if zoom > 0 { wv.pageZoom = zoom }
         return wv
     }
 
@@ -288,11 +504,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKUIDelegate, WKNaviga
         let flip = FlippedView(frame: rail.bounds)
         flip.autoresizingMask = [.width, .height]
         rail.addSubview(flip)
+        railContent = flip
 
         let side: CGFloat = 44
-        var y: CGFloat = 12
         for ws in workspaces {
-            let btn = NSButton(frame: NSRect(x: (width - side) / 2, y: y, width: side, height: side))
+            let btn = NSButton(frame: NSRect(x: 0, y: 0, width: side, height: side))
             btn.isBordered = false
             btn.bezelStyle = .regularSquare
             btn.imageScaling = .scaleProportionallyUpOrDown
@@ -304,27 +520,148 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKUIDelegate, WKNaviga
             btn.toolTip = ws.name
             btn.target = self
             btn.action = #selector(railClicked(_:))
+            btn.menu = railMenu(for: ws)   // right-click / ctrl-click
             flip.addSubview(btn)
             ws.button = btn
 
-            let d: CGFloat = 10
-            let dot = NSView(frame: NSRect(x: side - d, y: 0, width: d, height: d))
+            let dot = NSView(frame: .zero)
             dot.wantsLayer = true
             dot.layer?.backgroundColor = NSColor.systemRed.cgColor
-            dot.layer?.cornerRadius = d / 2
             dot.layer?.borderWidth = 2
             dot.layer?.borderColor = NSColor(calibratedWhite: 0.12, alpha: 1).cgColor
             dot.isHidden = true
-            btn.addSubview(dot)
+            let label = NSTextField(labelWithString: "")
+            label.font = NSFont.systemFont(ofSize: 10, weight: .bold)
+            label.textColor = .white
+            label.alignment = .center
+            dot.addSubview(label)
+            flip.addSubview(dot)   // above the button, in the rail
             ws.dot = dot
+            ws.dotLabel = label
+        }
+        layoutRail()
+    }
 
+    // Stack the rail buttons top-down in the current workspace order.
+    func layoutRail() {
+        guard let flip = railContent else { return }
+        let side: CGFloat = 44
+        var y: CGFloat = 12
+        for ws in workspaces {
+            ws.button?.frame = NSRect(x: (flip.bounds.width - side) / 2, y: y, width: side, height: side)
+            updateRailBadge(ws)
             y += side + 12
         }
     }
 
+    // Right-click menu on a rail button.
+    func railMenu(for ws: Workspace) -> NSMenu {
+        let menu = NSMenu()
+        for (title, action) in [("Move Up", #selector(moveWorkspaceUp(_:))),
+                                ("Move Down", #selector(moveWorkspaceDown(_:))),
+                                ("", nil),
+                                ("Change Logo\u{2026}", #selector(changeLogo(_:))),
+                                ("Reset Logo", #selector(resetLogo(_:)))] as [(String, Selector?)] {
+            guard let action = action else { menu.addItem(NSMenuItem.separator()); continue }
+            let item = menu.addItem(withTitle: title, action: action, keyEquivalent: "")
+            item.target = self
+            item.representedObject = ws
+        }
+        return menu
+    }
+
+    func validateMenuItem(_ item: NSMenuItem) -> Bool {
+        guard let ws = item.representedObject as? Workspace,
+              let i = workspaces.firstIndex(where: { $0 === ws }) else { return true }
+        switch item.action {
+        case #selector(moveWorkspaceUp(_:)): return i > 0
+        case #selector(moveWorkspaceDown(_:)): return i < workspaces.count - 1
+        case #selector(resetLogo(_:)): return FileManager.default.fileExists(atPath: customLogoURL(ws).path)
+        default: return true
+        }
+    }
+
+    @objc func moveWorkspaceUp(_ sender: NSMenuItem) { moveWorkspace(sender, by: -1) }
+    @objc func moveWorkspaceDown(_ sender: NSMenuItem) { moveWorkspace(sender, by: 1) }
+
+    func moveWorkspace(_ sender: NSMenuItem, by delta: Int) {
+        guard let ws = sender.representedObject as? Workspace,
+              let i = workspaces.firstIndex(where: { $0 === ws }),
+              workspaces.indices.contains(i + delta) else { return }
+        workspaces.swapAt(i, i + delta)
+        UserDefaults.standard.set(workspaces.map { $0.key }, forKey: "WorkspaceOrder")
+        layoutRail()
+        setupMainMenu()   // Cmd+1..9 follow the new order
+    }
+
+    // Custom logos live outside the app bundle so they survive rebuilds.
+    func customLogoURL(_ ws: Workspace) -> URL {
+        let dir = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+            .appendingPathComponent(Bundle.main.bundleIdentifier ?? "Chats")
+            .appendingPathComponent("logos")
+        let safe = ws.key.map { $0.isLetter || $0.isNumber || $0 == "-" ? $0 : "_" }
+        return dir.appendingPathComponent(String(safe) + ".png")
+    }
+
+    @objc func changeLogo(_ sender: NSMenuItem) {
+        guard let ws = sender.representedObject as? Workspace else { return }
+        let panel = NSOpenPanel()
+        panel.message = "Choose a logo for \(ws.name) (square PNG works best)"
+        panel.allowedContentTypes = [.image]
+        panel.allowsMultipleSelection = false
+        panel.beginSheetModal(for: window) { [weak self] resp in
+            guard resp == .OK, let src = panel.url, let self = self else { return }
+            guard let img = NSImage(contentsOf: src), let tiff = img.tiffRepresentation,
+                  let png = NSBitmapImageRep(data: tiff)?.representation(using: .png, properties: [:]) else {
+                NSSound.beep()
+                return
+            }
+            let dest = self.customLogoURL(ws)
+            try? FileManager.default.createDirectory(at: dest.deletingLastPathComponent(),
+                                                     withIntermediateDirectories: true)
+            do {
+                try png.write(to: dest)
+            } catch {
+                NSAlert(error: error).runModal()
+                return
+            }
+            ws.button?.image = self.workspaceImage(ws)
+        }
+    }
+
+    @objc func resetLogo(_ sender: NSMenuItem) {
+        guard let ws = sender.representedObject as? Workspace else { return }
+        try? FileManager.default.removeItem(at: customLogoURL(ws))
+        ws.button?.image = workspaceImage(ws)
+    }
+
+    // Rail badge: hidden, a small dot (unread, no count), or a red pill with
+    // the count, pinned to the button's top-right corner.
+    func updateRailBadge(_ ws: Workspace) {
+        guard let dot = ws.dot, let label = ws.dotLabel, let btn = ws.button else { return }
+        let show = ws.unread || ws.unreadCount > 0
+        dot.isHidden = !show
+        guard show else { return }
+        if ws.unreadCount > 0 {
+            label.stringValue = ws.unreadCount > 99 ? "99+" : String(ws.unreadCount)
+            let h: CGFloat = 18
+            let w = max(h, ceil(label.intrinsicContentSize.width) + 10)
+            dot.frame = NSRect(x: btn.frame.maxX - w + 6, y: btn.frame.minY - 4, width: w, height: h)
+            label.frame = NSRect(x: 0, y: (h - label.intrinsicContentSize.height) / 2,
+                                 width: w, height: label.intrinsicContentSize.height)
+            label.isHidden = false
+            dot.layer?.cornerRadius = h / 2
+        } else {
+            let d: CGFloat = 12
+            dot.frame = NSRect(x: btn.frame.maxX - d + 2, y: btn.frame.minY - 2, width: d, height: d)
+            label.isHidden = true
+            dot.layer?.cornerRadius = d / 2
+        }
+    }
+
     func workspaceImage(_ ws: Workspace) -> NSImage? {
-        var logo: NSImage?
-        if let f = ws.iconFile {
+        var logo = NSImage(contentsOf: customLogoURL(ws))   // set via right-click > Change Logo
+        if logo == nil, let f = ws.iconFile {
             let base = (f as NSString).deletingPathExtension
             let ext = (f as NSString).pathExtension
             if let path = Bundle.main.path(forResource: base, ofType: ext) {
@@ -370,10 +707,42 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKUIDelegate, WKNaviga
                 : NSColor.clear.cgColor
         }
         current = ws
+        UserDefaults.standard.set(ws.name, forKey: "LastWorkspace")
         window.title = workspaces.count > 1
             ? "\((Bundle.main.object(forInfoDictionaryKey: "CFBundleName") as? String) ?? "Chat") -- \(ws.name)"
             : ws.name
         window.makeFirstResponder(ws.webView)
+    }
+
+    // MARK: - Menu actions
+
+    @objc func selectWorkspaceFromMenu(_ sender: NSMenuItem) {
+        guard sender.tag < workspaces.count else { return }
+        window.makeKeyAndOrderFront(nil)
+        select(workspaces[sender.tag])
+    }
+
+    @objc func nextWorkspace(_ sender: Any?) { stepWorkspace(1) }
+    @objc func previousWorkspace(_ sender: Any?) { stepWorkspace(-1) }
+
+    func stepWorkspace(_ delta: Int) {
+        guard let cur = current, let i = workspaces.firstIndex(where: { $0 === cur }) else { return }
+        let n = workspaces.count
+        select(workspaces[((i + delta) % n + n) % n])
+    }
+
+    @objc func reloadPage(_ sender: Any?) { current?.webView.reload() }
+
+    // Zoom applies to the current workspace and is remembered per workspace.
+    @objc func zoomIn(_ sender: Any?) { setZoom { $0 + 0.1 } }
+    @objc func zoomOut(_ sender: Any?) { setZoom { $0 - 0.1 } }
+    @objc func zoomReset(_ sender: Any?) { setZoom { _ in 1 } }
+
+    func setZoom(_ change: (CGFloat) -> CGFloat) {
+        guard let ws = current else { return }
+        let z = min(3, max(0.5, (change(ws.webView.pageZoom) * 10).rounded() / 10))
+        ws.webView.pageZoom = z
+        UserDefaults.standard.set(Double(z), forKey: "Zoom.\(ws.name)")
     }
 
     // MARK: - Navigation / popups
@@ -383,6 +752,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKUIDelegate, WKNaviga
     func webView(_ webView: WKWebView,
                  decidePolicyFor navigationAction: WKNavigationAction,
                  decisionHandler: @escaping (WKNavigationActionPolicy) -> Void) {
+        if navigationAction.shouldPerformDownload {
+            decisionHandler(.download)
+            return
+        }
         let isMainFrame = navigationAction.targetFrame?.isMainFrame ?? true
         if navigationAction.navigationType == .linkActivated, isMainFrame,
            let url = navigationAction.request.url, isExternal(url) {
@@ -403,6 +776,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKUIDelegate, WKNaviga
                  createWebViewWith configuration: WKWebViewConfiguration,
                  for navigationAction: WKNavigationAction,
                  windowFeatures: WKWindowFeatures) -> WKWebView? {
+        if navigationAction.shouldPerformDownload {
+            webView.startDownload(using: navigationAction.request) { [weak self] dl in
+                dl.delegate = self
+            }
+            return nil
+        }
         if let url = navigationAction.request.url {
             if isExternal(url) {
                 openExternally(url)
@@ -480,29 +859,337 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKUIDelegate, WKNaviga
         }
     }
 
+    // Closing the main window hides it instead, so the app keeps running and the
+    // unread dots stay current. Clicking the Dock icon brings it back; Cmd+Q quits.
+    func windowShouldClose(_ sender: NSWindow) -> Bool {
+        if sender === window {
+            window.orderOut(nil)
+            return false
+        }
+        return true
+    }
+
+    func applicationShouldHandleReopen(_ app: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
+        if !window.isVisible { window.makeKeyAndOrderFront(nil) }
+        return true
+    }
+
     // Drop our reference once a popup window is gone so it can deallocate.
     func windowWillClose(_ notification: Notification) {
         if let win = notification.object as? PopupWindow { popupWindows.remove(win) }
     }
 
+    // A response the web view can't render, or one the server marks as an
+    // attachment (Content-Disposition: attachment), becomes a download.
+    func webView(_ webView: WKWebView,
+                 decidePolicyFor navigationResponse: WKNavigationResponse,
+                 decisionHandler: @escaping (WKNavigationResponsePolicy) -> Void) {
+        if let http = navigationResponse.response as? HTTPURLResponse,
+           let cd = http.value(forHTTPHeaderField: "Content-Disposition"),
+           cd.lowercased().hasPrefix("attachment") {
+            decisionHandler(.download)
+            return
+        }
+        decisionHandler(navigationResponse.canShowMIMEType ? .allow : .download)
+    }
+
+    func webView(_ webView: WKWebView, navigationAction: WKNavigationAction, didBecome download: WKDownload) {
+        download.delegate = self
+    }
+
+    // A non-image attachment opened in the viewer turns into a download, leaving
+    // the viewer window blank -- close it.
+    func webView(_ webView: WKWebView, navigationResponse: WKNavigationResponse, didBecome download: WKDownload) {
+        download.delegate = self
+        if let win = popupWindows.first(where: { $0.contentView === webView }) { win.close() }
+    }
+
+    // MARK: - Downloads
+
+    // Save to ~/Downloads under the server's filename, adding " (1)", " (2)", ...
+    // instead of overwriting an existing file.
+    func download(_ download: WKDownload, decideDestinationUsing response: URLResponse,
+                  suggestedFilename: String, completionHandler: @escaping (URL?) -> Void) {
+        let dir = FileManager.default.urls(for: .downloadsDirectory, in: .userDomainMask)[0]
+        let name = suggestedFilename.isEmpty ? "download" : suggestedFilename
+        let base = (name as NSString).deletingPathExtension
+        let ext = (name as NSString).pathExtension
+        var dest = dir.appendingPathComponent(name)
+        var n = 1
+        while FileManager.default.fileExists(atPath: dest.path) {
+            dest = dir.appendingPathComponent(ext.isEmpty ? "\(base) (\(n))" : "\(base) (\(n)).\(ext)")
+            n += 1
+        }
+        downloads[download] = dest
+        completionHandler(dest)
+    }
+
+    // Bounce the Dock's Downloads stack, as Safari does.
+    func downloadDidFinish(_ download: WKDownload) {
+        guard let dest = downloads.removeValue(forKey: download) else { return }
+        DistributedNotificationCenter.default().post(
+            name: Notification.Name("com.apple.DownloadFileFinished"), object: dest.path)
+    }
+
+    func download(_ download: WKDownload, didFailWithError error: Error, resumeData: Data?) {
+        let dest = downloads.removeValue(forKey: download)
+        let alert = NSAlert()
+        alert.messageText = "Download failed"
+        alert.informativeText = [dest?.lastPathComponent, error.localizedDescription]
+            .compactMap { $0 }.joined(separator: "\n")
+        alert.runModal()
+    }
+
+    // MARK: - File picker
+
+    // <input type=file> (Chat's attach button). WKWebView shows no picker on
+    // macOS unless the UI delegate provides one.
+    func webView(_ webView: WKWebView, runOpenPanelWith parameters: WKOpenPanelParameters,
+                 initiatedByFrame frame: WKFrameInfo, completionHandler: @escaping ([URL]?) -> Void) {
+        let panel = NSOpenPanel()
+        panel.canChooseFiles = true
+        panel.canChooseDirectories = parameters.allowsDirectories
+        panel.allowsMultipleSelection = parameters.allowsMultipleSelection
+        if let host = webView.window {
+            panel.beginSheetModal(for: host) { completionHandler($0 == .OK ? panel.urls : nil) }
+        } else {
+            completionHandler(panel.runModal() == .OK ? panel.urls : nil)
+        }
+    }
+
+    // MARK: - JavaScript dialogs
+
+    // alert() / confirm() / prompt(). Without these WKUIDelegate methods
+    // WKWebView shows nothing: alert is dropped, confirm answers "Cancel",
+    // prompt answers null.
+    func jsDialog(_ webView: WKWebView, _ message: String, buttons: [String],
+                  accessory: NSView? = nil, done: @escaping (NSApplication.ModalResponse) -> Void) {
+        let alert = NSAlert()
+        alert.messageText = webView.url?.host ?? "Chat"
+        alert.informativeText = message
+        buttons.forEach { alert.addButton(withTitle: $0) }
+        alert.accessoryView = accessory
+        if let host = webView.window, host.isVisible {
+            alert.beginSheetModal(for: host, completionHandler: done)
+            if let field = accessory { alert.window.initialFirstResponder = field }
+        } else {
+            done(alert.runModal())
+        }
+    }
+
+    func webView(_ webView: WKWebView, runJavaScriptAlertPanelWithMessage message: String,
+                 initiatedByFrame frame: WKFrameInfo, completionHandler: @escaping () -> Void) {
+        jsDialog(webView, message, buttons: ["OK"]) { _ in completionHandler() }
+    }
+
+    func webView(_ webView: WKWebView, runJavaScriptConfirmPanelWithMessage message: String,
+                 initiatedByFrame frame: WKFrameInfo, completionHandler: @escaping (Bool) -> Void) {
+        jsDialog(webView, message, buttons: ["OK", "Cancel"]) { completionHandler($0 == .alertFirstButtonReturn) }
+    }
+
+    func webView(_ webView: WKWebView, runJavaScriptTextInputPanelWithPrompt prompt: String,
+                 defaultText: String?, initiatedByFrame frame: WKFrameInfo,
+                 completionHandler: @escaping (String?) -> Void) {
+        let field = NSTextField(frame: NSRect(x: 0, y: 0, width: 260, height: 24))
+        field.stringValue = defaultText ?? ""
+        jsDialog(webView, prompt, buttons: ["OK", "Cancel"], accessory: field) {
+            completionHandler($0 == .alertFirstButtonReturn ? field.stringValue : nil)
+        }
+    }
+
     // MARK: - Unread badge
 
     // The injected probe reports whether a workspace has unread (favicon "dot"
-    // variant). Show a dot on that workspace's rail button, and an aggregate dot
-    // on the Dock icon if ANY workspace has unread -- Google Chat exposes no
-    // reliable total count, only this per-account signal.
+    // variant) and, when Chat shows one, how many. The rail badge shows the
+    // count (or a plain dot), and the Dock shows the total across workspaces.
+    // A workspace with the dot but no readable count counts as 1.
     func userContentController(_ uc: WKUserContentController, didReceive message: WKScriptMessage) {
+        if message.name == "notify" { handleNotify(message); return }
         guard message.name == "badge" else { return }
-        let unread = (message.body as? Bool) ?? false
+        let body = message.body as? [String: Any]
+        let unread = (body?["unread"] as? Bool) ?? false
+        let count = (body?["count"] as? Int) ?? 0
+        let messages = (body?["messages"] as? [[String: Any]]) ?? []
         if let ws = workspaces.first(where: { $0.webView === message.webView }) {
+            let wasUnread = ws.unread, oldCount = ws.unreadCount
             ws.unread = unread
-            ws.dot?.isHidden = !unread
+            ws.unreadCount = count
+            updateRailBadge(ws)
+            // A named banner per new message when the page could tell which
+            // conversation it was in; otherwise a generic one when unread starts
+            // or the count goes up. Skip the first report: that is the unread
+            // state at launch, not news.
+            for m in messages { notifyMessage(ws, m) }
+            if ws.unreadReported && (unread != wasUnread || count > oldCount) { notifyUnread(ws) }
+            ws.unreadReported = true
         }
-        let any = workspaces.contains { $0.unread }
-        NSApp.dockTile.badgeLabel = any ? "\u{25CF}" : nil   // U+25CF BLACK CIRCLE
+        let total = workspaces.reduce(0) { $0 + ($1.unread ? max($1.unreadCount, 1) : $1.unreadCount) }
+        NSApp.dockTile.badgeLabel = total > 0 ? String(total) : nil
     }
 
-    func applicationShouldTerminateAfterLastWindowClosed(_ app: NSApplication) -> Bool { true }
+    // MARK: - Desktop notifications
+
+    // Runs `new Notification(...)` in the current workspace's page, exercising
+    // the whole shim -> native -> Notification Center path without needing an
+    // incoming Chat message. The banner shows after a short delay so you can
+    // switch away first (banners are suppressed for the on-screen workspace).
+    @objc func sendTestNotification(_ sender: Any?) {
+        guard let ws = current else { return }
+        let name = ws.name.filter { $0.isLetter || $0.isNumber || $0 == " " }
+        window.orderOut(nil)
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1) {
+            ws.webView.evaluateJavaScript(
+                "new Notification('Test notification', { body: 'Chats can show notifications for \(name).' })")
+        }
+    }
+
+    // Post a page notification (from the notifyShim) to Notification Center. The
+    // request id carries the workspace index + page notification id so a click
+    // can route back; a page "tag" makes later notifications replace earlier
+    // ones, as in a browser.
+    func handleNotify(_ message: WKScriptMessage) {
+        guard let body = message.body as? [String: Any],
+              let type = body["type"] as? String,
+              let id = body["id"] as? String,
+              let ws = workspaces.first(where: { $0.webView === message.webView }) else { return }
+        let center = UNUserNotificationCenter.current()
+
+        if type == "close" {
+            notifFrames.removeValue(forKey: id)
+            center.getDeliveredNotifications { delivered in
+                let ids = delivered.filter { ($0.request.content.userInfo["pageID"] as? String) == id }
+                    .map { $0.request.identifier }
+                center.removeDeliveredNotifications(withIdentifiers: ids)
+            }
+            return
+        }
+        guard type == "show" else { return }
+
+        notifFrames[id] = message.frameInfo
+        ws.lastPageNotification = Date()
+        if notifFrames.count > 200, let oldest = notifFrames.keys.min() {
+            notifFrames.removeValue(forKey: oldest)   // ids start with a ms timestamp
+        }
+
+        let content = UNMutableNotificationContent()
+        content.title = (body["title"] as? String) ?? ""
+        content.body = (body["body"] as? String) ?? ""
+        if workspaces.count > 1 { content.subtitle = ws.name }
+        content.sound = .default
+        content.threadIdentifier = ws.name
+        content.userInfo = ["workspace": ws.key, "pageID": id]
+        let tag = (body["tag"] as? String) ?? ""
+        let reqID = tag.isEmpty ? "\(ws.key)|\(id)" : "\(ws.key)|tag|\(tag)"
+        center.add(UNNotificationRequest(identifier: reqID, content: content, trigger: nil))
+        bounceDock()
+    }
+
+    // One Dock bounce for a new message while the app is in the background
+    // (the same as Slack's default; .criticalRequest would bounce until opened).
+    func bounceDock() {
+        if !NSApp.isActive { NSApp.requestUserAttention(.informationalRequest) }
+    }
+
+    func workspace(forKey key: Any?) -> Workspace? {
+        guard let key = key as? String else { return nil }
+        return workspaces.first { $0.key == key }
+    }
+
+    // A new message in a known conversation: banner titled with the
+    // conversation (the sender, for a DM) and, when Chat's Home list shows it,
+    // the message preview. One banner per conversation; a newer message
+    // replaces the older one. Clicking opens that conversation.
+    func notifyMessage(_ ws: Workspace, _ m: [String: Any]) {
+        guard let conv = m["id"] as? String, !conv.isEmpty else { return }
+        let name = (m["name"] as? String) ?? ""
+        let text = (m["text"] as? String) ?? ""
+        ws.lastPageNotification = Date()   // suppresses the generic banner
+        let content = UNMutableNotificationContent()
+        content.title = name.isEmpty ? ws.name : name
+        if workspaces.count > 1 && !name.isEmpty { content.subtitle = ws.name }
+        content.body = text.isEmpty ? "New message" : text
+        content.sound = .default
+        content.threadIdentifier = ws.name
+        content.userInfo = ["workspace": ws.key, "conversation": conv]
+        UNUserNotificationCenter.current().add(
+            UNNotificationRequest(identifier: "\(ws.key)|conv|\(conv)", content: content, trigger: nil))
+        bounceDock()
+    }
+
+    // A workspace went unread, its unread count rose, or it was read. Chat's
+    // real alerts never reach this app (see notifyShim), so post a banner per
+    // workspace (each replaces the last) and withdraw it once read. Chat
+    // exposes no sender or text here, only that -- and roughly how much -- is
+    // unread.
+    func notifyUnread(_ ws: Workspace) {
+        let center = UNUserNotificationCenter.current()
+        let reqID = "\(ws.key)|unread"
+        guard ws.unread || ws.unreadCount > 0 else {
+            let prefix = "\(ws.key)|"
+            center.getDeliveredNotifications { delivered in
+                center.removeDeliveredNotifications(withIdentifiers: delivered.map { $0.request.identifier }
+                    .filter { $0 == reqID || $0.hasPrefix(prefix + "conv|") })
+            }
+            return
+        }
+        if let t = ws.lastPageNotification, Date().timeIntervalSince(t) < 10 { return }
+        let content = UNMutableNotificationContent()
+        content.title = ws.name
+        content.body = ws.unreadCount > 1
+            ? "\(ws.unreadCount) unread messages in Google Chat"
+            : "New message in Google Chat"
+        content.sound = .default
+        content.threadIdentifier = ws.name
+        content.userInfo = ["workspace": ws.key]
+        center.add(UNNotificationRequest(identifier: reqID, content: content, trigger: nil))
+        bounceDock()
+    }
+
+    // Show banners while the app is frontmost too, except for the workspace
+    // that is already on screen (Chat itself is visible there).
+    func userNotificationCenter(_ center: UNUserNotificationCenter, willPresent notification: UNNotification,
+                                withCompletionHandler completionHandler: @escaping (UNNotificationPresentationOptions) -> Void) {
+        let key = notification.request.content.userInfo["workspace"]
+        DispatchQueue.main.async {
+            let ws = self.workspace(forKey: key)
+            let onScreen = NSApp.isActive && self.window.isVisible && ws != nil && ws === self.current
+            completionHandler(onScreen ? [] : [.banner, .sound, .list])
+        }
+    }
+
+    // Banner clicked: bring the window up on that workspace and fire the page's
+    // own click handler so Chat opens the conversation.
+    func userNotificationCenter(_ center: UNUserNotificationCenter, didReceive response: UNNotificationResponse,
+                                withCompletionHandler completionHandler: @escaping () -> Void) {
+        let info = response.notification.request.content.userInfo
+        DispatchQueue.main.async {
+            defer { completionHandler() }
+            NSApp.activate(ignoringOtherApps: true)
+            self.window.makeKeyAndOrderFront(nil)
+            guard let ws = self.workspace(forKey: info["workspace"]) else { return }
+            self.select(ws)
+            // Conversation ids look like "dm/y2-4eqAAAAE" or "space/AAQA..";
+            // checked before splicing into JS.
+            if let conv = info["conversation"] as? String,
+               conv.allSatisfy({ $0.isLetter || $0.isNumber || "/_-".contains($0) }) {
+                ws.webView.evaluateJavaScript("""
+                    (function(){
+                      var r = document.querySelector('[role=listitem][data-group-id="\(conv)"] [role=link]')
+                           || document.querySelector('[role=listitem][data-group-id="\(conv)"]');
+                      if (r) r.click();
+                    })();
+                    """)
+            }
+            // ids are "<ms>-<seq>" from the shim; checked before splicing into JS.
+            if let id = info["pageID"] as? String, id.allSatisfy({ $0.isNumber || $0 == "-" }) {
+                let frame = self.notifFrames.removeValue(forKey: id)
+                ws.webView.evaluateJavaScript("window.__chatNotifClick && window.__chatNotifClick('\(id)')",
+                                              in: frame, in: .page)
+            }
+        }
+    }
+
+    func applicationShouldTerminateAfterLastWindowClosed(_ app: NSApplication) -> Bool { false }
 }
 
 let app = NSApplication.shared
