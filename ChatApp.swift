@@ -1033,7 +1033,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKUIDelegate, WKNaviga
               if (visible(people)) { people.focus(); return true; }
               await new Promise((r) => requestAnimationFrame(r));
             }
-            return true;   // the picker opened; Chat put the focus where it wanted
+            // The picker opened; Chat put the focus where it wanted. (No comment
+            // may end the script: callAsyncJavaScript wraps it in a function.)
+            return true;
             """#, arguments: [:], in: nil, in: .page) { result in
             if (try? result.get()) as? Bool != true { NSSound.beep() }
         }
