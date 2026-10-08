@@ -19,6 +19,11 @@ Xcode project, no dependencies.
   dot on the Dock icon (also shown in cmd+tab) if any workspace does. Google
   Chat exposes no reliable total count, so the app mirrors Chat's own favicon
   "dot" signal -- the same thing that dots a browser tab.
+- **Menu-bar inbox.** The menu-bar icon shows the total unread; its menu
+  lists every unread conversation across all workspaces -- name, message
+  preview and count, newest first, grouped by workspace -- and clicking one
+  opens it. The Dock icon's right-click menu lists the same, one line each. Toggle
+  the icon under Chats > Show in Menu Bar.
 - **Closing the window hides it** (Cmd+W): the app keeps running, so unread
   counts and notifications stay live; click the Dock icon to bring it back.
 - **Stays connected.** After sleep or a network outage of more than a minute

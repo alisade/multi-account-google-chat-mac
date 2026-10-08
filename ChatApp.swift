@@ -45,6 +45,7 @@ final class Workspace {
     var unreadReported = false        // first badge report seen (startup state)
     var lastPageNotification: Date?   // last banner raised by the page itself
     var lastBanner: [String: (text: String, count: Int, at: Date)] = [:]   // per conversation, for de-duplication
+    var inbox: [(id: String, name: String, text: String, count: Int)] = []   // unread conversations, newest first
     var markupMissing: Set<String> = []   // selectors already logged as not matching
     var crashes: [Date] = []          // recent web-process crashes, for reload backoff
 
@@ -79,6 +80,13 @@ let safariVersion: String = {
 let chatLog = Logger(subsystem: Bundle.main.bundleIdentifier ?? "com.local.chats", category: "chat-page")
 
 let safariUA = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/\(safariVersion) Safari/605.1.15"
+
+// A menu-bar inbox entry: which workspace, which conversation.
+final class InboxRef {
+    let ws: Workspace
+    let conv: String
+    init(ws: Workspace, conv: String) { self.ws = ws; self.conv = conv }
+}
 
 // Loads a Google service's own page once, top-level, in a hidden web view that
 // shares a workspace's data store, then discards itself. See warmUpCompanions.
@@ -121,7 +129,7 @@ final class CompanionWarmUp: NSObject, WKNavigationDelegate {
     }
 }
 
-final class AppDelegate: NSObject, NSApplicationDelegate, WKUIDelegate, WKNavigationDelegate, WKScriptMessageHandler, WKDownloadDelegate, UNUserNotificationCenterDelegate, NSWindowDelegate {
+final class AppDelegate: NSObject, NSApplicationDelegate, WKUIDelegate, WKNavigationDelegate, WKScriptMessageHandler, WKDownloadDelegate, UNUserNotificationCenterDelegate, NSWindowDelegate, NSMenuItemValidation, NSMenuDelegate {
     var window: NSWindow!
     var container: NSView!
     var workspaces: [Workspace] = []
@@ -131,6 +139,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKUIDelegate, WKNaviga
     var railContent: FlippedView?
     var downloads: [WKDownload: URL] = [:]   // in-flight download -> destination
     var notifFrames: [String: WKFrameInfo] = [:]   // page notification id -> frame that raised it
+    var statusItem: NSStatusItem?          // menu-bar icon
     var pathMonitor: NWPathMonitor?
     var offlineSince: Date?
     var asleepSince: Date?
@@ -216,6 +225,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKUIDelegate, WKNaviga
         appMenu.addItem(withTitle: "Show All",
                         action: #selector(NSApplication.unhideAllApplications(_:)), keyEquivalent: "")
         appMenu.addItem(NSMenuItem.separator())
+        appMenu.addItem(withTitle: "Show in Menu Bar", action: #selector(toggleMenuBarIcon(_:)), keyEquivalent: "").target = self
+        appMenu.addItem(NSMenuItem.separator())
         appMenu.addItem(withTitle: "Send Test Notification",
                         action: #selector(sendTestNotification(_:)), keyEquivalent: "")
         appMenu.addItem(NSMenuItem.separator())
@@ -295,6 +306,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKUIDelegate, WKNaviga
         window.center()
         window.makeKeyAndOrderFront(nil)
 
+        if UserDefaults.standard.object(forKey: "ShowMenuBarIcon") as? Bool ?? true { installStatusItem() }
         watchSleepAndNetwork()
         // Give Chat's side-panel companions their own sign-in up front.
         DispatchQueue.main.asyncAfter(deadline: .now() + 8) { [weak self] in
@@ -379,8 +391,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKUIDelegate, WKNaviga
               if (ts > 1e14) ts = Math.floor(ts / 1000);
               var it = r.innerText || '';
               var nm = /(\d+)\s+Notifications?/.exec(it);
-              var c = map[id] || (map[id] = { id: id, ts: 0, alerts: 0, name: '', text: '' });
+              var c = map[id] || (map[id] = { id: id, ts: 0, alerts: 0, name: '', text: '', unread: false });
               c.ts = Math.max(c.ts, ts);
+              // Unread rows: the Home list marks them data-is-unread="true"; the
+              // sidebar shows an "Unread" label (hidden, so not in innerText,
+              // when read).
+              if (r.getAttribute('data-is-unread') === 'true' || /\bUnread\b/.test(it)) c.unread = true;
               if (nm) c.alerts = Math.max(c.alerts, parseInt(nm[1], 10));
               var preview = r.querySelector('[jsname=ok3btb]');
               if (preview && !c.text) c.text = (preview.innerText || '').trim().slice(0, 300);
@@ -417,7 +433,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKUIDelegate, WKNaviga
               seenAlerts[id] = c.alerts;
             }
 
-            var key = unread + ':' + count;
+            // The unread conversations, newest first, for the menu-bar inbox.
+            var inbox = [];
+            for (var k in convs) if (convs[k].unread) inbox.push(convs[k]);
+            inbox.sort(function(a, b){ return b.ts - a.ts; });
+            inbox = inbox.slice(0, 20).map(function(c){
+              return { id: c.id, name: c.name, text: c.text, count: c.alerts };
+            });
+
+            var key = unread + ':' + count + ':' + inbox.map(function(c){
+              return c.id + '/' + c.count + '/' + c.text.length;
+            }).join(',');
             // Which of the selectors this relies on currently match, so the app
             // can log when Chat's markup changes under it.
             // (Not in the first 30 s: the sidebar is empty while Chat loads.)
@@ -428,7 +454,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKUIDelegate, WKNaviga
             if (key !== last || messages.length) {
               last = key;
               window.webkit.messageHandlers.badge.postMessage(
-                { unread: unread, count: count, messages: messages, health: health });
+                { unread: unread, count: count, messages: messages, inbox: inbox, health: health });
             }
           }
           setInterval(check, 2000);
@@ -589,6 +615,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKUIDelegate, WKNaviga
         }
     }
 
+    func validateMenuItem(_ item: NSMenuItem) -> Bool {
+        if item.action == #selector(toggleMenuBarIcon(_:)) { item.state = statusItem != nil ? .on : .off }
+        return true
+    }
+
     // Rail badge: hidden, a small dot (unread, no count), or a red pill with
     // the count, pinned to the button's top-right corner.
     func updateRailBadge(_ ws: Workspace) {
@@ -676,7 +707,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKUIDelegate, WKNaviga
         ws.webView.reload()
     }
 
-    // MARK: - Window
+    // MARK: - Window, launch at login, menu bar
 
     func showWindow(_ ws: Workspace? = nil) {
         NSApp.activate(ignoringOtherApps: true)
@@ -684,11 +715,77 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKUIDelegate, WKNaviga
         if let ws = ws { select(ws) }
     }
 
-    // Dock badge and rail badges from the current unread state.
+    @objc func toggleMenuBarIcon(_ sender: Any?) {
+        if let item = statusItem {
+            NSStatusBar.system.removeStatusItem(item)
+            statusItem = nil
+        } else {
+            installStatusItem()
+        }
+        UserDefaults.standard.set(statusItem != nil, forKey: "ShowMenuBarIcon")
+    }
+
+    func installStatusItem() {
+        statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
+        statusItem?.menu = NSMenu()
+        statusItem?.menu?.delegate = self
+        updateBadges()
+    }
+
+    // One line per workspace with its unread count; used by the menu-bar icon
+    // and the Dock icon's right-click menu.
+    func workspaceMenu(into menu: NSMenu) {
+        for ws in workspaces {
+            var title = ws.name
+            let n = ws.unread ? max(ws.unreadCount, 1) : ws.unreadCount
+            if n > 0 { title += " (\(n))" }
+            let item = menu.addItem(withTitle: title, action: #selector(openWorkspace(_:)), keyEquivalent: "")
+            item.target = self
+            item.representedObject = ws
+        }
+    }
+
+    @objc func openWorkspace(_ sender: NSMenuItem) {
+        showWindow(sender.representedObject as? Workspace)
+    }
+
+    // Dock right-click: each workspace, then its unread conversations. The Dock
+    // draws menus itself as plain text, so each is one line: "Name -- preview".
+    func applicationDockMenu(_ sender: NSApplication) -> NSMenu? {
+        let menu = NSMenu()
+        let workspaceItems = NSMenu()
+        workspaceMenu(into: workspaceItems)
+        for ws in workspaces {
+            if let item = workspaceItems.items.first(where: { $0.representedObject as? Workspace === ws }) {
+                workspaceItems.removeItem(item)
+                menu.addItem(item)
+            }
+            for c in ws.inbox {
+                var title = "      " + (c.name.isEmpty ? "Conversation" : c.name)
+                let preview = c.text.replacingOccurrences(of: "\n", with: " ")
+                if !preview.isEmpty {
+                    title += " \u{2014} " + (preview.count > 40 ? String(preview.prefix(37)) + "\u{2026}" : preview)
+                }
+                let item = menu.addItem(withTitle: title, action: #selector(openInboxItem(_:)), keyEquivalent: "")
+                item.target = self
+                item.representedObject = InboxRef(ws: ws, conv: c.id)
+            }
+        }
+        return menu
+    }
+
+    // Dock badge, menu-bar icon and rail badges from the current unread state.
     func updateBadges() {
         workspaces.forEach(updateRailBadge)
         let total = workspaces.reduce(0) { $0 + ($1.unread ? max($1.unreadCount, 1) : $1.unreadCount) }
         NSApp.dockTile.badgeLabel = total > 0 ? String(total) : nil
+        if let button = statusItem?.button {
+            let symbol = total > 0 ? "bubble.left.and.bubble.right.fill" : "bubble.left.and.bubble.right"
+            button.image = NSImage(systemSymbolName: symbol, accessibilityDescription: "Chats")
+            button.image?.isTemplate = true
+            button.title = total > 0 ? " \(total)" : ""
+            button.imagePosition = .imageLeading
+        }
     }
 
     // MARK: - Sleep, network and crash recovery
@@ -1100,6 +1197,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKUIDelegate, WKNaviga
         let count = (body?["count"] as? Int) ?? 0
         let messages = (body?["messages"] as? [[String: Any]]) ?? []
         if let ws = workspaces.first(where: { $0.webView === message.webView }) {
+            ws.inbox = ((body?["inbox"] as? [[String: Any]]) ?? []).compactMap { c in
+                guard let id = c["id"] as? String, !id.isEmpty else { return nil }
+                return (id, (c["name"] as? String) ?? "", (c["text"] as? String) ?? "", (c["count"] as? Int) ?? 0)
+            }
             checkMarkup(ws, body?["health"] as? [String: Any], unread: unread)
             let wasUnread = ws.unread, oldCount = ws.unreadCount
             ws.unread = unread
@@ -1449,6 +1550,64 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKUIDelegate, WKNaviga
             chatLog.info("Mark as Read: no Home-list button; opening the conversation instead")
             self?.openConversation(ws, conv)
         }
+    }
+
+    // The menu-bar icon's menu is rebuilt each time it opens.
+    func menuNeedsUpdate(_ menu: NSMenu) {
+        guard menu === statusItem?.menu else { return }
+        menu.removeAllItems()
+        inboxMenu(into: menu)
+        menu.addItem(NSMenuItem.separator())
+        menu.addItem(withTitle: "Open Chats", action: #selector(openFromMenuBar(_:)), keyEquivalent: "").target = self
+        menu.addItem(withTitle: "Quit Chats", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "")
+    }
+
+    @objc func openFromMenuBar(_ sender: Any?) { showWindow() }
+
+    // The menu-bar inbox: each workspace (click to open it) followed by its
+    // unread conversations, newest first -- name, preview and count. Clicking
+    // one opens that conversation.
+    func inboxMenu(into menu: NSMenu) {
+        let nameFont = NSFont.menuFont(ofSize: 13)
+        let previewFont = NSFont.menuFont(ofSize: 11)
+        var any = false
+        for ws in workspaces {
+            let header = NSMenu()
+            workspaceMenu(into: header)
+            if let item = header.items.first(where: { $0.representedObject as? Workspace === ws }) {
+                header.removeItem(item)
+                item.attributedTitle = NSAttributedString(string: item.title, attributes: [
+                    .font: NSFont.boldSystemFont(ofSize: 13)])
+                menu.addItem(item)
+            }
+            for c in ws.inbox {
+                any = true
+                let title = NSMutableAttributedString(
+                    string: (c.name.isEmpty ? "Conversation" : c.name) + (c.count > 0 ? "  (\(c.count))" : ""),
+                    attributes: [.font: nameFont])
+                let preview = c.text.replacingOccurrences(of: "\n", with: " ")
+                if !preview.isEmpty {
+                    let short = preview.count > 60 ? String(preview.prefix(57)) + "\u{2026}" : preview
+                    title.append(NSAttributedString(string: "\n" + short, attributes: [
+                        .font: previewFont, .foregroundColor: NSColor.secondaryLabelColor]))
+                }
+                let item = menu.addItem(withTitle: c.name, action: #selector(openInboxItem(_:)), keyEquivalent: "")
+                item.attributedTitle = title
+                item.indentationLevel = 1
+                item.target = self
+                item.representedObject = InboxRef(ws: ws, conv: c.id)
+            }
+        }
+        if !any {
+            menu.addItem(NSMenuItem.separator())
+            menu.addItem(withTitle: "No unread messages", action: nil, keyEquivalent: "").isEnabled = false
+        }
+    }
+
+    @objc func openInboxItem(_ sender: NSMenuItem) {
+        guard let ref = sender.representedObject as? InboxRef else { return }
+        showWindow(ref.ws)
+        openConversation(ref.ws, ref.conv)
     }
 
     func applicationShouldTerminateAfterLastWindowClosed(_ app: NSApplication) -> Bool { false }
