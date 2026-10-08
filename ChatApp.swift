@@ -380,6 +380,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKUIDelegate, WKNaviga
             return '';
           }
 
+          // A row's own visible "Unread" label -- a text node that is exactly
+          // "Unread", not part of a name or a preview ("Unread PRs need
+          // review"). Chat hides the label once the conversation is read.
+          function hasUnreadLabel(row) {
+            var w = document.createTreeWalker(row, NodeFilter.SHOW_TEXT);
+            for (var n = w.nextNode(); n; n = w.nextNode()) {
+              if (n.nodeValue.trim() !== 'Unread') continue;
+              var el = n.parentElement;
+              if (el && !el.closest('[jsname=ok3btb]') && el.getClientRects().length) return true;
+            }
+            return false;
+          }
+
           function conversations() {
             var map = {};
             var rows = document.querySelectorAll('[role=listitem][data-group-id][data-display-timestamp]');
@@ -394,9 +407,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKUIDelegate, WKNaviga
               var c = map[id] || (map[id] = { id: id, ts: 0, alerts: 0, name: '', text: '', unread: false });
               c.ts = Math.max(c.ts, ts);
               // Unread rows: the Home list marks them data-is-unread="true"; the
-              // sidebar shows an "Unread" label (hidden, so not in innerText,
-              // when read).
-              if (r.getAttribute('data-is-unread') === 'true' || /\bUnread\b/.test(it)) c.unread = true;
+              // sidebar shows an "Unread" label, hidden once read.
+              if (r.getAttribute('data-is-unread') === 'true' || hasUnreadLabel(r)) c.unread = true;
               if (nm) c.alerts = Math.max(c.alerts, parseInt(nm[1], 10));
               var preview = r.querySelector('[jsname=ok3btb]');
               if (preview && !c.text) c.text = (preview.innerText || '').trim().slice(0, 300);
@@ -441,9 +453,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKUIDelegate, WKNaviga
               return { id: c.id, name: c.name, text: c.text, count: c.alerts };
             });
 
-            var key = unread + ':' + count + ':' + inbox.map(function(c){
-              return c.id + '/' + c.count + '/' + c.text.length;
-            }).join(',');
+            // Any change to what the inbox shows (a name that loads late, a new
+            // preview of the same length) is reported.
+            var key = unread + ':' + count + ':' + JSON.stringify(inbox);
             // Which of the selectors this relies on currently match, so the app
             // can log when Chat's markup changes under it.
             // (Not in the first 30 s: the sidebar is empty while Chat loads.)
@@ -1579,6 +1591,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKUIDelegate, WKNaviga
                 item.attributedTitle = NSAttributedString(string: item.title, attributes: [
                     .font: NSFont.boldSystemFont(ofSize: 13)])
                 menu.addItem(item)
+            }
+            // The count (favicon dot / Home label) can be non-zero while no
+            // unread row is rendered -- a collapsed section, a virtualized list.
+            let total = ws.unread ? max(ws.unreadCount, 1) : ws.unreadCount
+            if ws.inbox.isEmpty && total > 0 {
+                any = true
+                let item = menu.addItem(withTitle: "\(total) unread \u{2014} open Chat to see them",
+                                        action: #selector(openWorkspace(_:)), keyEquivalent: "")
+                item.indentationLevel = 1
+                item.target = self
+                item.representedObject = ws
             }
             for c in ws.inbox {
                 any = true
