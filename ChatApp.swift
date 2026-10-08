@@ -1141,9 +1141,28 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKUIDelegate, WKNaviga
         showWindow(sender.representedObject as? Workspace)
     }
 
+    // Dock right-click: each workspace, then its unread conversations. The Dock
+    // draws menus itself as plain text, so each is one line: "Name -- preview".
     func applicationDockMenu(_ sender: NSApplication) -> NSMenu? {
         let menu = NSMenu()
-        workspaceMenu(into: menu)
+        let workspaceItems = NSMenu()
+        workspaceMenu(into: workspaceItems)
+        for ws in workspaces {
+            if let item = workspaceItems.items.first(where: { $0.representedObject as? Workspace === ws }) {
+                workspaceItems.removeItem(item)
+                menu.addItem(item)
+            }
+            for c in ws.inbox {
+                var title = "      " + (c.name.isEmpty ? "Conversation" : c.name)
+                let preview = c.text.replacingOccurrences(of: "\n", with: " ")
+                if !preview.isEmpty {
+                    title += " \u{2014} " + (preview.count > 40 ? String(preview.prefix(37)) + "\u{2026}" : preview)
+                }
+                let item = menu.addItem(withTitle: title, action: #selector(openInboxItem(_:)), keyEquivalent: "")
+                item.target = self
+                item.representedObject = InboxRef(ws: ws, conv: c.id)
+            }
+        }
         return menu
     }
 

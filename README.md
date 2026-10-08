@@ -34,7 +34,7 @@ Xcode project, no dependencies.
 - **Menu-bar inbox.** The menu-bar icon shows the total unread; its menu
   lists every unread conversation across all workspaces -- name, message
   preview and count, newest first, grouped by workspace -- and clicking one
-  opens it. The Dock icon's right-click menu lists the workspaces too. Toggle
+  opens it. The Dock icon's right-click menu lists the same, one line each. Toggle
   the icon under Chats > Show in Menu Bar.
 - **Launch at Login** under the Chats menu.
 - **Keyboard shortcuts**: Cmd+1..9 switch workspace, Cmd+Shift+[ / ] step
