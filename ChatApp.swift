@@ -43,6 +43,7 @@ final class Workspace {
     var unreadCount = 0               // Chat's "Home" unread count; 0 if not shown
     var unreadReported = false        // first badge report seen (startup state)
     var lastPageNotification: Date?   // last banner raised by the page itself
+    var lastBanner: [String: (text: String, at: Date)] = [:]   // per conversation, for de-duplication
 
     // Stable per-workspace key (survives reordering; the store UUID also
     // survives renaming when pinned in workspaces.conf).
@@ -1095,29 +1096,29 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKUIDelegate, WKNaviga
         return workspaces.first { $0.key == key }
     }
 
-    // Post a banner that replaces the previous one in the same group (one
-    // conversation, or a workspace's generic "unread" banner). Each post gets a
-    // fresh request id: re-adding an id that is still in Notification Center
-    // only updates it in place -- no banner, no sound -- so a second message
-    // before the first was read would arrive silently.
-    func postReplacing(_ content: UNNotificationContent, group: String) {
-        let center = UNUserNotificationCenter.current()
-        center.getDeliveredNotifications { delivered in
-            let old = delivered.map { $0.request.identifier }.filter { $0.hasPrefix(group + "#") }
-            center.removeDeliveredNotifications(withIdentifiers: old)
-            center.add(UNNotificationRequest(identifier: group + "#" + UUID().uuidString,
-                                             content: content, trigger: nil))
-        }
+    // Post a banner with a fresh request id under a group prefix (one
+    // conversation, or a workspace's generic "unread" banner) so the group can
+    // be withdrawn together once read. Every post is its own banner: re-adding
+    // an id still in Notification Center would only update it in place -- no
+    // banner, no sound.
+    func postBanner(_ content: UNNotificationContent, group: String) {
+        UNUserNotificationCenter.current().add(
+            UNNotificationRequest(identifier: group + "#" + UUID().uuidString, content: content, trigger: nil))
     }
 
     // A new message in a known conversation: banner titled with the
     // conversation (the sender, for a DM) and, when Chat's Home list shows it,
-    // the message preview. One banner per conversation; a newer message
-    // replaces the older one. Clicking opens that conversation.
+    // the message preview. Every message gets its own banner; clicking one
+    // opens that conversation.
     func notifyMessage(_ ws: Workspace, _ m: [String: Any]) {
         guard let conv = m["id"] as? String, !conv.isEmpty else { return }
         let name = (m["name"] as? String) ?? ""
         let text = (m["text"] as? String) ?? ""
+        // Chat bumps a row's timestamp several times for one message (seen: 4
+        // bumps in 10 s). Skip a repeat of the same conversation + text within
+        // 15 s; a different message always gets its own banner.
+        if let last = ws.lastBanner[conv], last.text == text, Date().timeIntervalSince(last.at) < 15 { return }
+        ws.lastBanner[conv] = (text, Date())
         ws.lastPageNotification = Date()   // suppresses the generic banner
         let content = UNMutableNotificationContent()
         content.title = name.isEmpty ? ws.name : name
@@ -1126,13 +1127,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKUIDelegate, WKNaviga
         content.sound = .default
         content.threadIdentifier = ws.name
         content.userInfo = ["workspace": ws.key, "conversation": conv]
-        postReplacing(content, group: "\(ws.key)|conv|\(conv)")
+        postBanner(content, group: "\(ws.key)|conv|\(conv)")
         bounceDock()
     }
 
     // A workspace went unread, its unread count rose, or it was read. Chat's
     // real alerts never reach this app (see notifyShim), so post a banner per
-    // workspace (each replaces the last) and withdraw it once read. Chat
+    // workspace and withdraw them all once read. Chat
     // exposes no sender or text here, only that -- and roughly how much -- is
     // unread.
     func notifyUnread(_ ws: Workspace) {
@@ -1154,7 +1155,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKUIDelegate, WKNaviga
         content.sound = .default
         content.threadIdentifier = ws.name
         content.userInfo = ["workspace": ws.key]
-        postReplacing(content, group: "\(ws.key)|unread")
+        postBanner(content, group: "\(ws.key)|unread")
         bounceDock()
     }
 
