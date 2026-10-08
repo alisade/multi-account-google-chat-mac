@@ -1095,33 +1095,47 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKUIDelegate, WKNaviga
         }
     }
 
-    // Mode 1: a workspace that has been off screen (not the one shown, or the
-    // app in the background) for N minutes and is not on Home is reloaded to
-    // Home. A full load, not a click: Chat's in-page router may not act while
-    // its page is hidden.
+    // Mode 1: a workspace that has been off screen for N minutes and is not on
+    // Home is reloaded to Home. "On screen" means it is the workspace shown in
+    // a window that is actually visible -- whether or not Chats is the active
+    // app, so one you are reading on a second monitor is never reloaded. A full
+    // load, not a click: Chat's in-page router may not act while hidden.
     func sendBackgroundWorkspacesHome() {
+        let windowOnScreen = window.isVisible && window.occlusionState.contains(.visible)
         for ws in workspaces {
-            if ws === current && window.isVisible && NSApp.isActive {
+            // Only time spent off screen while this mode is on counts, so
+            // switching into it does not reload long-hidden workspaces at once.
+            if previewMode != 1 || (ws === current && windowOnScreen) {
                 ws.backgroundSince = nil
                 continue
             }
             let since = ws.backgroundSince ?? Date()
             ws.backgroundSince = since
-            guard previewMode == 1, Date().timeIntervalSince(since) >= Double(returnHomeMinutes) * 60,
+            guard Date().timeIntervalSince(since) >= Double(returnHomeMinutes) * 60,
                   let pageURL = ws.webView.url, pageURL.path != "/", !pageURL.path.hasSuffix("/app/home")
             else { continue }
             // Never while the page is elsewhere (a sign-in on accounts.google.com,
-            // say) or in a call: a reload would discard it.
-            guard pageURL.host?.lowercased() == ws.host,
-                  ws.webView.cameraCaptureState == .none, ws.webView.microphoneCaptureState == .none
-            else { continue }
+            // say) or in a call -- in the workspace itself or a popup it opened:
+            // a reload would discard it.
+            let inCall = ([ws.webView] + popupWebViews(of: ws)).contains {
+                $0.cameraCaptureState != .none || $0.microphoneCaptureState != .none
+            }
+            guard pageURL.host?.lowercased() == ws.host, !inCall else { continue }
             ws.webView.requestMediaPlaybackState { [weak self] state in
                 // Audio playing (e.g. listening in a huddle with the mic off).
                 guard state != .playing, self?.previewMode == 1 else { return }
+                ws.backgroundSince = nil
                 ws.unreadReported = false
                 ws.webView.load(URLRequest(url: ws.url))
             }
         }
+    }
+
+    // Popup windows (image viewer, calls) opened from a workspace: they share
+    // its data store.
+    func popupWebViews(of ws: Workspace) -> [WKWebView] {
+        popupWindows.compactMap { $0.contentView as? WKWebView }
+            .filter { $0.configuration.websiteDataStore === ws.webView.configuration.websiteDataStore }
     }
 
     // MARK: - Settings window
@@ -1132,7 +1146,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKUIDelegate, WKNaviga
 
     static let previewHelpText = [
         "Previews appear while that workspace is on Chat's Home view. Otherwise banners show the sender and \u{201C}New message\u{201D}.",
-        "A workspace you haven't looked at for a while reloads to Home, so previews keep coming. Switching back lands you on Home instead of the conversation you left.",
+        "A workspace that has been off screen for a while reloads to Home, so previews keep coming -- never the one you can see, even with another app in front. Switching back to it lands you on Home instead of the conversation you left.",
         "Each workspace keeps an invisible copy of Chat on Home, used only for previews; your view stays where you left it. Uses more memory -- about one more Chat page per workspace.",
     ]
 
