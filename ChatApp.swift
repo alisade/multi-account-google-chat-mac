@@ -235,6 +235,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKUIDelegate, WKNaviga
         appMenu.addItem(withTitle: "Quit \(appName)",
                         action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
 
+        let fileItem = NSMenuItem()
+        mainMenu.addItem(fileItem)
+        let fileMenu = NSMenu(title: "File")
+        fileItem.submenu = fileMenu
+        fileMenu.addItem(withTitle: "New Chat", action: #selector(newChat(_:)), keyEquivalent: "n").target = self
+
         let editItem = NSMenuItem()
         mainMenu.addItem(editItem)
         let editMenu = NSMenu(title: "Edit")
@@ -1008,6 +1014,29 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKUIDelegate, WKNaviga
             }
             return false;
             """#, arguments: [:], in: nil, in: .page, completionHandler: nil)
+    }
+
+    // Cmd+N: Chat's own "New chat" button (the floating action button at the
+    // top of the sidebar), which opens its people picker -- "Add 1 or more
+    // people", plus Create a space / Browse spaces / Find apps -- and focuses it.
+    @objc func newChat(_ sender: Any?) {
+        guard let ws = current else { return }
+        if !window.isVisible || !NSApp.isActive { showWindow() }
+        ws.webView.callAsyncJavaScript(#"""
+            const visible = (e) => !!(e && (e.offsetWidth || e.offsetHeight || e.getClientRects().length));
+            const button = [...document.querySelectorAll('button[data-is-fab="true"], button')]
+              .find((b) => visible(b) && /^New chat$/i.test((b.innerText || b.getAttribute('aria-label') || '').trim()));
+            if (!button) return false;
+            button.click();
+            for (const until = Date.now() + 1500; Date.now() < until;) {
+              const people = document.querySelector('input[aria-label="Add 1 or more people"]');
+              if (visible(people)) { people.focus(); return true; }
+              await new Promise((r) => requestAnimationFrame(r));
+            }
+            return true;   // the picker opened; Chat put the focus where it wanted
+            """#, arguments: [:], in: nil, in: .page) { result in
+            if (try? result.get()) as? Bool != true { NSSound.beep() }
+        }
     }
 
     // Ctrl+Option+C from any app shows Chats, or hides it if it is in front.

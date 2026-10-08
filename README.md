@@ -36,7 +36,8 @@ Xcode project, no dependencies.
   Chats > Show in Menu Bar.
 - **Launch at Login** under the Chats menu.
 - **Keyboard shortcuts**: Cmd+1..9 switch workspace, Cmd+Shift+[ / ] step
-  through them, Cmd+F focuses Chat's search, Cmd+R reloads, Cmd+= / Cmd+- /
+  through them, Cmd+N starts a new chat (Chat's people picker), Cmd+F
+  focuses Chat's search, Cmd+R reloads, Cmd+= / Cmd+- /
   Cmd+0 zoom (saved per workspace), Cmd+W hides the window, and
   **Ctrl+Option+C** shows or hides Chats from any app. The app reopens on the
   last workspace.
