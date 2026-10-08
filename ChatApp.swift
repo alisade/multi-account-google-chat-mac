@@ -46,6 +46,7 @@ final class Workspace {
     var lastPageNotification: Date?   // last banner raised by the page itself
     var lastBanner: [String: (text: String, at: Date)] = [:]   // per conversation, for de-duplication
     var markupMissing: Set<String> = []   // selectors already logged as not matching
+    var crashes: [Date] = []          // recent web-process crashes, for reload backoff
 
     // Stable per-workspace key (survives reordering; the store UUID also
     // survives renaming when pinned in workspaces.conf).
@@ -730,9 +731,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKUIDelegate, WKNaviga
     }
 
     // WebKit killed the page's process (memory pressure, crash): reload it
-    // rather than leave a blank workspace.
+    // rather than leave a blank workspace. A page that keeps crashing
+    // (typically macOS killing it under memory pressure) is reloaded with
+    // backoff -- at once, then after 10 s, then 60 s -- and after 3 crashes in
+    // 10 minutes left alone until the next wake or reconnect.
     func webViewWebContentProcessDidTerminate(_ webView: WKWebView) {
-        if let ws = workspaces.first(where: { $0.webView === webView }) { reload(ws) }
+        guard let ws = workspaces.first(where: { $0.webView === webView }) else { return }
+        ws.crashes = ws.crashes.filter { Date().timeIntervalSince($0) < 600 } + [Date()]
+        let delays: [Double] = [0, 10, 60]
+        guard ws.crashes.count <= delays.count else {
+            chatLog.error("\(ws.name, privacy: .public): page crashed \(ws.crashes.count) times in 10 minutes; not reloading")
+            return
+        }
+        let delay = delays[ws.crashes.count - 1]
+        chatLog.warning("\(ws.name, privacy: .public): page crashed; reloading in \(Int(delay), privacy: .public) s")
+        DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in self?.reload(ws) }
     }
 
     // MARK: - Side-panel companions (Calendar)
